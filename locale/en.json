@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-message-revision",
+    "description": "Edit and resend sent messages in place, rewinding subsequent turns and associated subagent sessions."
+  }
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: message-revision
+      name: '@kabxx/dsh-message-revision'

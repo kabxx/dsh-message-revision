@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-message-revision",
+    "description": "原位编辑并重新发送历史消息，同步回退后续对话及关联的子智能体会话。"
+  }
+}
