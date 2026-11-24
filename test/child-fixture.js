@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -23,7 +23,7 @@ export function turn(turnNumber, time, extra = []) {
 }
 
 export async function childFixture(t, sessions) {
-  const directory = await mkdtemp(join(tmpdir(), 'dsh-child-revision-test-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'dsh-child-revision-test-')));
   const entries = new Map();
   const writers = new Set();
   t.after(() => rm(directory, { recursive: true, force: true }));

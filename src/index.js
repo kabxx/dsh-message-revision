@@ -1,7 +1,14 @@
 import {
-  assertNoPendingRewrite, isRevisionAttachment, planRevision, recoverStoredSessions, resolveRevisionText,
-  retainedRevisionAttachments, RevisionError, revisionTextParts, rewriteStoredSession, splitChildCatalog,
+  assertNoPendingRewrite, isRevisionAttachment, planRevision, recoverPendingRewrite, recoverStoredSessions,
+  resolveRevisionText, retainedRevisionAttachments, RevisionError, revisionTextParts, rewriteMessage,
 } from './revision.js';
+import { prepareBoundedRevision, revalidateWork } from './bounded-revision.js';
+import { commitBoundedRevision, restoreBoundedJournal } from './bounded-commit.js';
+import {
+  assertRewriteSetSpace, matchJournalRevision, readRewriteJournals, RewriteJournalSpaceError, scheduleSettledRewriteRetirement,
+} from './rewrite-journal.js';
+import { createRevisionNotifications, registerRevisionNotifications } from './revision-notifications.js';
+import { isSamePath, resolveRolloutPath } from './platform.js';
 
 export const name = 'message-revision';
 export const inject = ['agents', 'connection', 'sessionController', 'sessionPersistence', 'sessions'];
@@ -11,9 +18,16 @@ const originalSymbol = Symbol.for('cordis.original');
 const headers = { 'Cache-Control': 'no-store' };
 const BUSY = '回复生成中，请先停止或等待完成。';
 const toolbarRevision = 1;
+const activeRevision = Symbol.for('dsh-message-revision.active-rewrite');
+
+function assertIdlePhase(agent) {
+  // This rc.5 driver reports its private maintenance phase as public idle.
+  if (agent.phase?.kind === 'maintenance') throw new RevisionError('会话正在维护或压缩上下文，请等操作完成后重试。');
+  if (agent.status !== 'idle' || (agent.phase !== undefined && agent.phase?.kind !== 'idle')) throw new RevisionError(BUSY);
+}
 
 function assertIdle(agent) {
-  if (agent.status !== 'idle') throw new RevisionError(BUSY);
+  assertIdlePhase(agent);
   if (agent.inbox.hasPending) throw new RevisionError('会话仍有排队消息，请等队列清空后再试。');
 }
 
@@ -45,6 +59,7 @@ function lifecycleDisposer(ctx, agent) {
     // The latest controller registration is the live generation. Its native
     // teardown must also release the exact scope of the Agent we're replacing.
     const active = lifecycle.at(-1);
+    assertIdlePhase(agent);
     await active();
     if ([...loop._disposables].includes(scope) || [...owner._disposables].includes(active)) throw failure();
     // Older revisions of this plugin could leave completed owner registrations.
@@ -57,17 +72,19 @@ async function assertNoActivity(ctx, sessionId) {
   if (activities?.length) throw new RevisionError(BUSY);
 }
 
-function assertChildrenIdle(ctx, agent, events, plan) {
-  const catalog = events.slice(agent.session.inheritedEventCount)
-    .filter(event => event.type === 'subagent/catalog');
-  const { withdrawn } = splitChildCatalog(catalog, plan);
-  const childIds = new Set(catalog.map(event => event.data.childId));
-  if (ctx.agents.list().some(candidate => childIds.has(candidate.id) && candidate.status !== 'idle')) {
-    throw new RevisionError('子智能体仍在运行，请等执行结束后再试。');
+function assertChildrenReleased(ctx, work) {
+  for (const { header: { id } } of work.entries.slice(1)) {
+    if (ctx.agents.get(id) || ctx.sessions.get(id)) {
+      throw new RevisionError('关联的子智能体会话仍处于打开状态，请关闭后重试。');
+    }
   }
-  const withdrawnIds = new Set(withdrawn.map(event => event.data.childId));
-  if (ctx.agents.list().some(candidate => withdrawnIds.has(candidate.id))) {
-    throw new RevisionError('关联的子智能体会话仍处于打开状态，请关闭后重试。');
+}
+
+function* nativeEvents(session, end = session.seq, start = 0) {
+  // Use bounded ranges of the immutable native log instead of retaining a
+  // second array of every event while the candidate is prepared or reopened.
+  for (let offset = start; offset < end; offset += 512) {
+    yield* session.snapshotEvents(offset, Math.min(end, offset + 512));
   }
 }
 
@@ -76,7 +93,7 @@ function editableAgent(ctx, sessionId) {
   if (!agent || ctx.sessions.get(sessionId) !== agent.session) {
     throw new RevisionError('请先打开该会话。');
   }
-  if (agent.session.header.origin === 'subagent' || agent.session.header.parentSession) {
+  if (agent.session.header.origin === 'subagent') {
     throw new RevisionError('子智能体会话不支持直接编辑，请在主会话中操作。');
   }
   assertIdle(agent);
@@ -91,20 +108,34 @@ function lastPermissionEvents(events) {
   return latest;
 }
 
-function modelAt(events) {
-  let pending;
-  let lastUsed;
+function foldControlState(events, cut) {
+  const currentPermissions = new Map();
+  const retainedPermissions = new Map();
+  let pendingModel;
+  let lastUsedModel;
+  let retainedModel;
+  let capturedPrefix = false;
   for (const event of events) {
-    if (event.type === 'model/selection') pending = event.data;
-    if (event.type === 'request/header') {
+    if (!capturedPrefix && event.seq >= cut) {
+      retainedModel = pendingModel ?? lastUsedModel;
+      capturedPrefix = true;
+    }
+    if (permissionEvents.includes(event.type)) {
+      currentPermissions.set(event.type, event);
+      if (event.seq < cut) retainedPermissions.set(event.type, event);
+    } else if (event.type === 'model/selection') {
+      pendingModel = event.data;
+    } else if (event.type === 'request/header') {
       const { config, adapterDefaults } = event.data.header;
       const effort = adapterDefaults?.reasoningEffort === true ? undefined : config.reasoningEffort;
-      lastUsed = { provider: config.provider, model: config.model,
+      lastUsedModel = { provider: config.provider, model: config.model,
         ...(effort === undefined ? {} : { reasoningEffort: effort }) };
-      if (sameModel(pending, lastUsed)) pending = undefined;
+      if (sameModel(pendingModel, lastUsedModel)) pendingModel = undefined;
     }
   }
-  return pending ?? lastUsed;
+  const currentModel = pendingModel ?? lastUsedModel;
+  if (!capturedPrefix) retainedModel = currentModel;
+  return { currentPermissions, retainedPermissions, currentModel, retainedModel };
 }
 
 function sameModel(first, second) {
@@ -112,9 +143,7 @@ function sameModel(first, second) {
     && first?.reasoningEffort === second?.reasoningEffort;
 }
 
-function preparePermissions(ctx, agent, events, prefix, preset) {
-  const current = lastPermissionEvents(events);
-  const retained = lastPermissionEvents(prefix);
+function preparePermissions(ctx, agent, current, retained, preset) {
   if (preset !== undefined) {
     const service = ctx.get('permissionPresets');
     if (!service || preset === 'custom') throw new RevisionError('不支持该权限预设。');
@@ -139,8 +168,8 @@ function preparePermissions(ctx, agent, events, prefix, preset) {
   });
 }
 
-async function prepareAmendments(ctx, agent, input, events, plan) {
-  const retained = retainedRevisionAttachments(plan.message, input.removedAttachments);
+async function prepareRevisionInputs(ctx, agent, input, original, settings) {
+  const retained = retainedRevisionAttachments(original, input.removedAttachments);
   const receiptIds = input.receiptIds ?? [];
   const uploads = receiptIds.length === 0 ? undefined : ctx.get('fileUploads');
   const staged = receiptIds.map(id => {
@@ -151,9 +180,15 @@ async function prepareAmendments(ctx, agent, input, events, plan) {
   if (input.text.trim() === '' && retained.length + staged.length === 0) {
     throw new RevisionError('请输入消息内容或至少保留一个附件。');
   }
-  const prefix = events.slice(0, plan.cut);
-  const model = input.model ?? agent.model.current();
-  const hasImages = [...retained, ...staged].some(part => part.type === 'image');
+  const stagedImages = staged.some(part => part.type === 'image');
+  const retainedImages = retained.some(part => part.type === 'image');
+  // Native admission counts upload bytes. Historical image references only
+  // contain the normalized size, even if no originalDimensions are present.
+  if (stagedImages && retainedImages) {
+    throw new RevisionError('旧图片的原始上传大小无法核对。请移除旧图片，或用原文件重新添加后再发送。');
+  }
+  const model = input.model ?? settings.model;
+  const hasImages = stagedImages || retainedImages;
   const llm = input.model || hasImages ? ctx.get('llm') : undefined;
   if (input.model) {
     try {
@@ -181,19 +216,21 @@ async function prepareAmendments(ctx, agent, input, events, plan) {
     const attachments = ctx.get('attachments');
     if (!attachments) throw new RevisionError('当前环境不支持上传附件。');
     try {
-      // Count retained images against the same combined native message limits.
-      const images = retained.filter(part => part.type === 'image')
-        .map(part => ({ ...part, encodedBytes: part.attachment.bytes }));
-      addedAttachments = (await attachments.admitPromptContent([...images, ...staged])).slice(images.length);
+      addedAttachments = await attachments.admitPromptContent(staged);
     } catch (error) {
       throw new RevisionError('附件校验未通过，请重新添加。', { cause: error });
     }
   }
-  const controls = preparePermissions(ctx, agent, events, prefix, input.permissionPreset);
-  if (model && !sameModel(model, modelAt(prefix)) && (input.model || modelAt(events))) {
+  return { retained, addedAttachments, model };
+}
+
+function revisionControls(ctx, agent, input, cut, model) {
+  const { currentPermissions, retainedPermissions, currentModel, retainedModel } = foldControlState(nativeEvents(agent.session), cut);
+  const controls = preparePermissions(ctx, agent, currentPermissions, retainedPermissions, input.permissionPreset);
+  if (model && !sameModel(model, retainedModel) && (input.model || currentModel)) {
     controls.push({ type: 'model/selection', data: model });
   }
-  return { addedAttachments, controls };
+  return controls;
 }
 
 function revisionSettings(ctx, agent) {
@@ -226,7 +263,27 @@ async function isUnchangedRevision(ctx, input, original, settings) {
     && await sameEffectiveModel(ctx, input.model, settings.model);
 }
 
-async function inspectRevision(ctx, { sessionId, messageId }) {
+async function recoverEditableSession(ctx, sessionId, recoverDelivery) {
+  let restored;
+  try {
+    restored = await recoverPendingRewrite(ctx.sessionPersistence, await ctx.sessionPersistence.stat(sessionId), {
+      beforeCommit: revisionCacheInvalidator(ctx),
+      canRollback: id => !ctx.agents.get(id) && !ctx.sessions.get(id),
+      restoreBoundedJournal,
+      recoverDelivery: recoverDelivery && (journal => recoverDelivery(journal.intent.parentId)),
+    });
+  } catch (error) {
+    if (error?.name === 'SessionAlreadyOwnedError') {
+      throw new RevisionError('上次编辑仍在等待会话释放，稍后可重新打开编辑框。', { cause: error });
+    }
+    if (error?.name === 'RewriteRollbackConflictError') throw new RevisionError(error.message, { cause: error });
+    throw error;
+  }
+  if (restored) await ctx.sessionController.resolveAgent(sessionId);
+}
+
+async function inspectRevision(ctx, { sessionId, messageId }, recoverDelivery) {
+  await recoverEditableSession(ctx, sessionId, recoverDelivery);
   const agent = editableAgent(ctx, sessionId);
   await ctx.sessions.flush(agent.session);
   const snapshot = await ctx.sessionPersistence.stat(sessionId);
@@ -234,17 +291,186 @@ async function inspectRevision(ctx, { sessionId, messageId }) {
     throw new RevisionError('会话状态已变更，请刷新后重试。');
   }
   await assertNoPendingRewrite(snapshot);
-  const events = agent.session.snapshotEvents();
-  const plan = planRevision(events, messageId, agent.session.inheritedEventCount);
-  const textParts = revisionTextParts(plan.message);
+  const { message } = planRevision(nativeEvents(agent.session), messageId, agent.session.inheritedEventCount);
+  const textParts = revisionTextParts(message);
   return { ok: true, toolbarRevision, revision: snapshot.revision,
     text: textParts.join(''), textParts, settings: revisionSettings(ctx, agent),
-    attachments: plan.message.content.flatMap((block, index) => isRevisionAttachment(block) ? [{ index, block }] : []),
+    attachments: message.content.flatMap((block, index) => isRevisionAttachment(block) ? [{ index, block }] : []),
   };
 }
 
 function deliveredRevision(agent, messageId) {
-  return agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.id === messageId);
+  for (const event of nativeEvents(agent.session)) {
+    if (event.type === 'user/message' && event.data.id === messageId) return true;
+  }
+  return false;
+}
+
+function committedPromptState(agent, journal) {
+  const { messageId } = journal.intent.delivery;
+  const begin = journal.intent.artifacts[0].candidate.records;
+  if (agent.session.seq < begin) throw new Error('Native session does not contain the committed revision');
+  // The committed candidate starts with exactly one pending next-turn item.
+  let position = 0;
+  let turn;
+  let claim;
+  for (const { type, data } of nativeEvents(agent.session, agent.session.seq, begin)) {
+    if (type === 'user/message' && data.id === messageId) return 'settled';
+    if (type === 'turn/start') {
+      turn = data.turn;
+    } else if (type === 'turn/end' && data.turn === turn) {
+      if (claim?.turn === data.turn) {
+        // A closed turn with recorded execution must not submit its input again.
+        if (data.reason.kind !== 'interrupted' || claim.executed) return 'settled';
+        claim.interrupted = true;
+      }
+      turn = undefined;
+    }
+    if (claim && turn === claim.turn && data.turn === claim.turn
+      && (type === 'assistant/message' || type === 'assistant/attempt' || type === 'tool/call' || type === 'tool/result')) {
+      claim.executed = true;
+    }
+    if (type !== 'agent/inbox/spliced' || data.target !== 'next-turn') continue;
+    const replacement = data.inserted.findIndex(message => message.id === messageId);
+    if (position === undefined) {
+      if (replacement >= 0) {
+        position = data.start + replacement;
+        claim = undefined;
+      }
+      continue;
+    }
+    if (position < data.start) continue;
+    const removed = data.removedCount ?? 0;
+    if (position < data.start + removed) {
+      if (replacement < 0) {
+        if (data.outcome === 'canceled') return 'settled';
+        if (turn === undefined) throw new Error('Native inbox claimed the committed input outside a turn');
+        position = undefined;
+        claim = { turn, executed: false, interrupted: false };
+      } else position = data.start + replacement;
+    } else position += data.inserted.length - removed;
+  }
+  if (position === undefined) return claim?.interrupted ? 'interrupted' : 'claimed';
+  if (agent.inbox.nextTurn[position]?.id !== messageId) throw new Error('Cannot reconcile the committed input with the native inbox');
+  return 'pending';
+}
+
+function findCommittedInput(session, journal) {
+  const { messageId } = journal.intent.delivery;
+  const begin = journal.intent.artifacts[0].candidate.records;
+  for (let end = begin; end > 0; end -= 512) {
+    const events = session.snapshotEvents(Math.max(0, end - 512), end);
+    for (let index = events.length - 1; index >= 0; index--) {
+      const { type, data } = events[index];
+      if (type !== 'agent/inbox/spliced' || data.target !== 'next-turn') continue;
+      const message = data.inserted.find(item => item.id === messageId);
+      if (message) return message;
+    }
+  }
+  throw new Error('Cannot find the revision input in the committed history');
+}
+
+async function deliverCommittedPrompt(ctx, agent, journal) {
+  const { parentId } = journal.intent;
+  if (ctx.agents.get(parentId) !== agent || ctx.sessions.get(parentId) !== agent.session) return 'waiting';
+  const state = committedPromptState(agent, journal);
+  if (state === 'settled') return await ctx.sessions.flush(agent.session) === true ? 'settled' : 'waiting';
+  if (state === 'claimed') return 'started';
+  if (agent.status !== 'idle' || agent.inbox.nextStep.length !== 0) return 'waiting';
+  if (state === 'interrupted') {
+    if (agent.inbox.nextTurn.length !== 0) return 'waiting';
+    // Native recovery durably closed an earlier claim before its user/message.
+    // Restore the same input only after confirming no request or tool ran.
+    agent.followup(findCommittedInput(agent.session, journal));
+  } else {
+    if (agent.inbox.nextTurn.length !== 1) return 'waiting';
+    // rc.5 can wake the existing queue item without another enqueue record.
+    if (typeof agent.wakeDriver !== 'function') throw new Error('Native inbox wakeup is unavailable');
+    agent.wakeDriver();
+  }
+  const after = committedPromptState(agent, journal);
+  return after === 'settled' && await ctx.sessions.flush(agent.session) === true ? 'settled' : 'started';
+}
+
+async function recoverCommittedPrompt(ctx, journal) {
+  const { parentId } = journal.intent;
+  let agent = ctx.agents.get(parentId);
+  const snapshot = agent ? undefined : await ctx.sessionPersistence.stat(parentId);
+  if (await matchJournalRevision(journal) !== 'candidate') throw new Error('Committed revision no longer matches its journal');
+  if (!agent) {
+    if (!isSamePath(snapshot?.location?.path, journal.dshPath ?? journal.parentPath) || ctx.sessions.get(parentId)
+      || !isSamePath(await resolveRolloutPath(snapshot.location.path), journal.parentPath)
+      || (await ctx.sessionPersistence.stat(parentId))?.revision !== snapshot.revision) return 'waiting';
+    const reopened = await ctx.sessionController.resolveAgent(parentId);
+    if (!reopened.agent) throw reopened.error ?? new Error('Cannot reopen the committed session');
+    agent = reopened.agent;
+  }
+  return deliverCommittedPrompt(ctx, agent, journal);
+}
+
+function installDeliveryRecovery(ctx) {
+  const tracked = new Set();
+  const pending = new Set();
+  let timer;
+  let started = false;
+  let disposed = false;
+  let running = false;
+  let currentId;
+  // Process outstanding deliveries serially after the initial journal scan.
+  // A failed cold open waits for the session's next native activation.
+  function schedule() {
+    if (!started || timer || running || disposed || pending.size === 0) return;
+    timer = setImmediate(() => { timer = undefined; void run(); });
+    timer.unref?.();
+  }
+  async function run() {
+    running = true;
+    try {
+      for (const id of pending) {
+        if (disposed) break;
+        pending.delete(id);
+        currentId = id;
+        try {
+          const snapshot = await ctx.sessionPersistence.stat(id);
+          const journal = (await readRewriteJournals(snapshot)).find(entry => entry.committed && entry.intent.delivery);
+          if (!journal) {
+            tracked.delete(id);
+            pending.delete(id);
+          } else if (await recoverCommittedPrompt(ctx, journal) === 'settled') {
+            scheduleSettledRewriteRetirement(journal, { onCleanupError(error) {
+              ctx.logger.warn('Saved message revision cleanup failed for %s: %s', id, error);
+            } });
+            tracked.delete(id);
+            pending.delete(id);
+          }
+        } catch (error) {
+          ctx.logger.warn('Pending message revision delivery for %s: %s', id, error);
+        } finally { currentId = undefined; }
+      }
+    } finally {
+      running = false;
+      schedule();
+    }
+  }
+  function track(id) { tracked.add(id); pending.add(id); schedule(); }
+  function onAgent(agent) {
+    if (agent.id !== currentId && tracked.has(agent.id)) { pending.add(agent.id); schedule(); }
+  }
+  ctx.effect(() => {
+    const created = ctx.on('agent/created', ({ agent }) => onAgent(agent));
+    const idle = ctx.on('agent/status', ({ agent, status }) => { if (status === 'idle') onAgent(agent); });
+    const finish = ctx.on('session/event', (session, event) => {
+      if (event.type !== 'user/message' && event.type !== 'turn/end') return;
+      const agent = ctx.agents.get(session.id);
+      if (agent?.session !== session || !tracked.has(agent.id)) return;
+      // Delivery can finish while this very session is being checked. Revisit
+      // it afterwards if that check did not already observe the final event.
+      pending.add(agent.id);
+      schedule();
+    });
+    return () => { disposed = true; clearImmediate(timer); created(); idle(); finish(); pending.clear(); tracked.clear(); };
+  });
+  return { track, start() { started = true; schedule(); } };
 }
 
 function revisionCacheInvalidator(ctx) {
@@ -256,55 +482,93 @@ function revisionCacheInvalidator(ctx) {
 }
 
 /** The Web route and isolated tests share this host operation. */
-export async function reviseSession(ctx, input, { onReopening } = {}) {
+export async function reviseSession(ctx, input, options = {}) {
   const { sessionId, messageId } = input;
+  await recoverEditableSession(ctx, sessionId, options.recoverDelivery);
   const agent = editableAgent(ctx, sessionId);
   await assertNoActivity(ctx, sessionId);
   await ctx.sessions.flush(agent.session);
   await assertNoActivity(ctx, sessionId);
   const snapshot = await ctx.sessionPersistence.stat(sessionId);
   await assertNoPendingRewrite(snapshot);
-  if (input.expectedRevision !== undefined) {
-    if (snapshot?.revision !== input.expectedRevision) {
-      throw new RevisionError('会话状态已变更，请重新打开编辑框。');
-    }
+  if (input.expectedRevision !== undefined && snapshot?.revision !== input.expectedRevision) {
+    throw new RevisionError('会话状态已变更，请重新打开编辑框。');
   }
-  assertIdle(agent);
-  if (ctx.agents.get(sessionId) !== agent || ctx.sessions.get(sessionId) !== agent.session) {
-    throw new RevisionError('会话状态已变更，请刷新后重试。');
+  if (editableAgent(ctx, sessionId) !== agent) throw new RevisionError('会话状态已变更，请刷新后重试。');
+  const seq = agent.session.seq;
+  const { message: original } = planRevision(nativeEvents(agent.session, seq), messageId, agent.session.inheritedEventCount);
+  const settings = revisionSettings(ctx, agent);
+  // Provider lookups can take arbitrarily long. Complete them before claiming
+  // the single resource slot used by the log worker and transaction.
+  if (await isUnchangedRevision(ctx, input, original, settings)) return { ok: true, unchanged: true };
+  const prepared = await prepareRevisionInputs(ctx, agent, input, original, settings);
+  options.signal?.throwIfAborted();
+  if (globalThis[activeRevision]) throw new RevisionError('已有会话正在编辑，请稍后重试。');
+  globalThis[activeRevision] = true;
+  try {
+    return await reviseSessionExclusive(ctx, input, { agent, seq, snapshot, prepared }, options);
+  } finally {
+    globalThis[activeRevision] = false;
   }
-  const events = agent.session.snapshotEvents();
-  const plan = planRevision(events, messageId, agent.session.inheritedEventCount);
-  if (await isUnchangedRevision(ctx, input, plan.message, revisionSettings(ctx, agent))) {
-    return { ok: true, unchanged: true };
-  }
-  const dispose = lifecycleDisposer(ctx, agent);
-  assertChildrenIdle(ctx, agent, events, plan);
-  const amendments = await prepareAmendments(ctx, agent, input, events, plan);
-  await ctx.sessions.flush(agent.session);
-  await assertNoActivity(ctx, sessionId);
-  if (editableAgent(ctx, sessionId) !== agent || agent.session.seq !== events.length) {
-    throw new RevisionError('会话状态已变更，请刷新后重试。');
-  }
-  assertChildrenIdle(ctx, agent, events, plan);
-  onReopening?.();
-  await dispose();
-  if (ctx.sessions.get(sessionId) || ctx.agents.get(sessionId)) {
-    throw new RevisionError('会话仍在释放中，请稍后重试。');
-  }
+}
 
-  let rewritten;
+async function reviseSessionExclusive(ctx, input, { agent, seq, snapshot, prepared },
+  { onReopening, onCommitted, signal, recoverDelivery }) {
+  const { sessionId, messageId } = input;
+  const validateAgent = () => {
+    if (editableAgent(ctx, sessionId) !== agent || agent.session.seq !== seq
+      || (!input.model && !sameModel(agent.model.current(), prepared.model))) {
+      throw new RevisionError('会话状态已变更，请重新提交。');
+    }
+  };
+  validateAgent();
+  if (typeof agent.wakeDriver !== 'function') throw new RevisionError('当前 DSH 版本不支持安全重发编辑后的消息。');
+  const dispose = lifecycleDisposer(ctx, agent);
+  const work = await prepareBoundedRevision(ctx.sessionPersistence, snapshot, messageId, plan => {
+    validateAgent();
+    const [record] = agent.session.snapshotEvents(plan.input.index, plan.input.index + 1);
+    const queued = record?.type === 'agent/inbox/spliced' && record.data.inserted?.[plan.input.offset];
+    if (queued?.id !== messageId || queued.source?.kind !== 'user') {
+      throw new RevisionError('无法核对原消息的入队记录，请重新打开编辑框。');
+    }
+    const retained = retainedRevisionAttachments(queued, input.removedAttachments);
+    if (JSON.stringify(retained) !== JSON.stringify(prepared.retained)) {
+      throw new RevisionError('会话附件与原始消息不一致，请重新打开编辑框。');
+    }
+    const controls = revisionControls(ctx, agent, input, plan.cut, prepared.model);
+    const { content } = rewriteMessage(queued, input, input.removedAttachments ?? [], prepared.addedAttachments);
+    return { message: { id: messageId, content }, controls };
+  }, { signal, eventCount: seq, inheritedCount: agent.session.inheritedEventCount });
+  if (!work) return { ok: true, unchanged: true };
+
+  const rewrittenChildren = work.artifacts.slice(1).map(artifact => artifact.header.id);
+  let childChanges;
   let updated;
   let reopenedSeq;
+  let released = false;
   try {
-    rewritten = await rewriteStoredSession(ctx.sessionPersistence, input, {
-      ...amendments,
+    await ctx.sessions.flush(agent.session);
+    await assertNoActivity(ctx, sessionId);
+    await revalidateWork(ctx.sessionPersistence, work);
+    await assertNoPendingRewrite(snapshot);
+    await assertRewriteSetSpace(work.parent, work.artifacts);
+    validateAgent();
+    assertChildrenReleased(ctx, work);
+    signal?.throwIfAborted();
+    onReopening?.();
+    await dispose();
+    released = true;
+    if (ctx.sessions.get(sessionId) || ctx.agents.get(sessionId)) {
+      throw new RevisionError('会话仍在释放中，请稍后重试。');
+    }
+    await commitBoundedRevision(ctx.sessionPersistence, work, {
       beforeCommit: revisionCacheInvalidator(ctx),
+      messageId,
       onCleanupError(error) {
         ctx.logger.warn('Saved message revision cleanup failed for %s: %s', sessionId, error);
       },
       canRollback() {
-        return ctx.agents.get(sessionId) === undefined && ctx.sessions.get(sessionId) === undefined;
+        return work.entries.every(({ header }) => !ctx.agents.get(header.id) && !ctx.sessions.get(header.id));
       },
       async closeFailedReload() {
         if (!updated) return;
@@ -321,7 +585,8 @@ export async function reviseSession(ctx, input, { onReopening } = {}) {
         if (!reopened.agent) throw reopened.error ?? new Error('无法重新打开会话。');
         updated = reopened.agent;
         reopenedSeq = updated.session.seq;
-        if (updated.inbox.nextTurn.some(message => message.id === messageId) || deliveredRevision(updated, messageId)) return;
+        if (typeof updated.wakeDriver === 'function' && (updated.inbox.nextTurn.some(message => message.id === messageId)
+          || deliveredRevision(updated, messageId))) return;
         // A startup hook may discard the candidate input and still return normally.
         // Close that provisional Agent only if no other request owns it.
         if (updated.status === 'idle' && !updated.inbox.hasPending) {
@@ -334,22 +599,36 @@ export async function reviseSession(ctx, input, { onReopening } = {}) {
         }
         throw new Error('重开会话时更新后的消息被移除。');
       },
-      async afterCommit({ messageId }) {
-        const pending = updated.inbox.nextTurn;
-        if (updated.status === 'idle' && pending.length === 1 && pending[0].id === messageId) {
-          if (!updated.inbox.remove(pending[0].id)) throw new Error('消息已保存，但未能触发发送。');
-          updated.followup(pending[0]);
-          await ctx.sessions.flush(updated.session);
-        } else if (!deliveredRevision(updated, messageId)) {
+      async afterCommit({ removedChildren }, journal) {
+        childChanges = {
+          ...(rewrittenChildren.length > 0 && { rewrittenChildren }),
+          ...(removedChildren.length > 0 && { withdrawnChildren: removedChildren }),
+          ...(work.affectedParentIds?.length > 0 && { affectedParentIds: work.affectedParentIds }),
+        };
+        onCommitted?.(childChanges);
+        try {
+          const delivery = await deliverCommittedPrompt(ctx, updated, journal);
+          if (delivery === 'settled') return true;
+          recoverDelivery?.(sessionId);
+          if (delivery === 'started') return false;
           throw new Error('消息已保存，但尚未触发发送。');
+        } catch (error) {
+          recoverDelivery?.(sessionId);
+          throw error;
         }
       },
     });
   } catch (error) {
-    if (error instanceof RevisionError) await ctx.sessionController.resolveAgent(sessionId);
-    throw error;
+    const rejected = error instanceof RewriteJournalSpaceError
+      ? new RevisionError(error.message, { cause: error }) : error;
+    if (released && (rejected instanceof RevisionError || rejected.name === 'SessionAlreadyOwnedError')) {
+      await ctx.sessionController.resolveAgent(sessionId);
+    }
+    throw rejected;
+  } finally {
+    await work.dispose().catch(error => ctx.logger?.warn('Cannot clean up message revision staging: %s', error));
   }
-  return { ok: true, reload: true, ...(rewritten.cleanupWarning && { cleanupWarning: true }) };
+  return { ok: true, reload: true, ...childChanges };
 }
 
 function validId(value) {
@@ -386,13 +665,23 @@ function parseSubmission(body) {
 }
 
 export async function apply(ctx) {
+  const notifications = createRevisionNotifications();
+  const deliveryRecovery = installDeliveryRecovery(ctx);
+  const recoverDelivery = deliveryRecovery.track;
+  const recoveryLifetime = new AbortController();
+  ctx.effect(() => () => recoveryLifetime.abort());
   if (typeof ctx.sessionPersistence.list === 'function') {
     await recoverStoredSessions(ctx.sessionPersistence, {
+      retrySignal: recoveryLifetime.signal,
       beforeCommit: revisionCacheInvalidator(ctx),
       canRollback: id => !ctx.agents.get(id) && !ctx.sessions.get(id),
+      restoreBoundedJournal,
+      recoverDelivery: journal => { recoverDelivery(journal.intent.parentId); },
       onError: (id, error) => ctx.logger.warn('Pending message revision recovery for %s: %s', id, error),
     }).catch(error => ctx.logger.warn('Cannot scan pending message revisions: %s', error));
   }
+  ctx.effect(() => () => notifications.close());
+  ctx.inject?.(['typert'], scope => registerRevisionNotifications(scope, notifications));
   const requests = new Set();
   ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/message-revision',
@@ -410,7 +699,7 @@ export async function apply(ctx) {
       }
       if (body.text === undefined) {
         try {
-          return send(await inspectRevision(ctx, body));
+          return send(await inspectRevision(ctx, body, recoverDelivery));
         } catch (error) {
           if (error instanceof RevisionError) return send({ ok: false, error: error.message }, 409);
           ctx.logger.warn('Message revision inspection failed: %s', error);
@@ -424,20 +713,30 @@ export async function apply(ctx) {
       if (requests.has(body.sessionId)) return send({ ok: false, error: '当前会话正在处理编辑请求。' }, 409);
       requests.add(body.sessionId);
       let reopening = false;
-      const failure = (error, status) => send({ ok: false, error, ...(reopening && { reconnect: true }) }, status);
+      let childChanges;
+      const failure = (error, status) => send({ ok: false, error, ...(reopening && { reconnect: true }), ...childChanges }, status);
       try {
         request.signal.throwIfAborted();
-        return send(await reviseSession(ctx, submission, { onReopening: () => { reopening = true; } }));
+        return send(await reviseSession(ctx, submission, {
+          signal: request.signal,
+          recoverDelivery,
+          onReopening: () => { reopening = true; },
+          onCommitted(changes) {
+            childChanges = changes;
+            notifications.publish(changes);
+          },
+        }));
       } catch (error) {
-        if (error instanceof RevisionError) return failure(error.message, 409);
+        if (error instanceof RevisionError || error?.name === 'RewriteRollbackConflictError') return failure(error.message, 409);
         if (error?.name === 'SessionAlreadyOwnedError') {
           return failure('会话正被其他操作占用，请稍后重试。', 409);
         }
         ctx.logger.warn('Message revision failed: %s', error);
-        return failure('编辑失败，请重试。', 500);
+        return failure(reopening ? '编辑未完成，请先检查当前会话。' : '编辑失败，请重试。', 500);
       } finally {
         requests.delete(body.sessionId);
       }
     },
   }));
+  deliveryRecovery.start();
 }

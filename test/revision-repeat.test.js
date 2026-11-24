@@ -3,8 +3,9 @@ import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import { zstdCompressSync } from 'node:zlib';
 import { planRevision, rewriteStoredSession } from '../src/revision.js';
+import { decompressZstdConcat } from '../src/rollout-stream.js';
 
 const text = value => ({ type: 'text', text: value });
 const user = (id, value, source = {}) => ({ id, role: 'user', source: { kind: 'user', ...source }, content: [text(value)] });
@@ -38,7 +39,7 @@ function history() {
 
 for (const compressed of [false, true]) {
   test(`revising twice replaces all retained copies in ${compressed ? 'compressed' : 'plain'} rollout`, async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'dsh-message-revision-repeat-'));
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'dsh-message-revision-repeat-')));
     const path = join(directory, `session.v4.jsonl${compressed ? '.zstd' : ''}`);
     const id = 'repeat-fixture';
     const events = history();
@@ -57,7 +58,7 @@ for (const compressed of [false, true]) {
       await writeFile(path, compressed ? zstdCompressSync(content) : content);
       await rewriteStoredSession(persistence, { sessionId: id, messageId: target, text: 'final edit C' });
       const raw = await readFile(path);
-      const decoded = (compressed ? zstdDecompressSync(raw) : raw).toString('utf8');
+      const decoded = (compressed ? decompressZstdConcat(raw) : raw).toString('utf8');
       assert.doesNotMatch(decoded, /previous edit B/u);
       const [savedHeader, ...saved] = decoded.trimEnd().split('\n').map(line => JSON.parse(line));
       assert.deepEqual(savedHeader, header);

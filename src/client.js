@@ -10,15 +10,21 @@ window.__ModuleLoader__.load({
         cleanupPending: '消息已更新并重发，部分旧记录待清理。',
         unchanged: '内容未修改', tooLong: '消息不能超过 200,000 个字符。',
         uploadWait: '附件仍在上传或上传失败，请处理后再发送。',
+        historicalImageSize: '旧图片的原始上传大小无法核对。请移除旧图片，或用原文件重新添加后再发送。',
         fileUnavailable: '当前会话无法添加附件。', fileDirectory: '不支持直接添加文件夹，请选择单个文件。',
         anotherEdit: '请先完成或取消当前编辑。',
         missing: '未找到该消息，请刷新后重试。', unsupported: '此消息不支持编辑。',
+        nonIndependentTurn: '此消息没有可独立回退的对话轮次。',
+        subagentUnsupported: '子智能体会话不支持直接编辑，请在主会话中操作。',
+        queuePending: '会话仍有排队消息，请等队列清空后再试。',
+        inheritedDuplicate: '无法替换继承历史中的同一条消息。',
         locked: '会话正被占用，暂时无法编辑。', changed: '会话状态已变更，请重新打开编辑框。',
         'composer-unavailable': '输入框未能加载，请刷新页面后重试。',
         'toolbar-update': '插件前后端版本不一致，请重新加载插件。',
         'child-conflict': '关联的子智能体会话无法回退，暂不支持编辑此消息。',
         syncing: '消息已更新，请重新打开会话刷新视图。',
         draftSaved: '草稿已保留。',
+        deliveryUnknown: '连接已中断，请先检查原会话是否已更新。',
         draftConflict: '原消息已变更，请先复制草稿后关闭重试。',
         textPart: '正文', sendPart: '发送',
         'reconnect-unavailable': '会话连接不可用，请重新打开会话。',
@@ -30,21 +36,28 @@ window.__ModuleLoader__.load({
         cleanupPending: 'Message updated and resent; some old records remain.',
         unchanged: 'No changes to send', tooLong: 'Message exceeds 200,000 characters.',
         uploadWait: 'Wait for uploads to finish or remove failed attachments.',
+        historicalImageSize: 'The upload size of an existing image is unavailable. Remove existing images or reattach them from the original files before sending.',
         fileUnavailable: 'Attachments are unavailable for this session.', fileDirectory: 'Folders are not supported; select individual files.',
         anotherEdit: 'Finish or cancel the current edit first.',
         missing: 'Message not found. Refresh and try again.', unsupported: 'This message cannot be edited.',
+        nonIndependentTurn: 'This message does not have an independently rewindable turn.',
+        subagentUnsupported: 'Subagent sessions cannot be edited directly. Edit from the main session instead.',
+        queuePending: 'Queued messages are still pending. Wait for the queue to clear and try again.',
+        inheritedDuplicate: 'Cannot replace a message that also appears in inherited history.',
         locked: 'Session is in use and cannot be edited right now.', changed: 'Session state changed. Reopen the editor.',
         'composer-unavailable': 'Failed to load the editor. Refresh the page and try again.',
         'toolbar-update': 'Plugin version mismatch. Reload the plugin.',
         'child-conflict': 'Cannot rewind associated subagent sessions for this message.',
         syncing: 'Message updated. Reopen the session to refresh.',
         draftSaved: 'Draft preserved.',
+        deliveryUnknown: 'The connection dropped. Check whether the conversation was updated.',
         draftConflict: 'Original message changed. Copy your draft and reopen to edit.',
         textPart: 'Text block', sendPart: 'Send',
         'reconnect-unavailable': 'Session connection unavailable. Reopen this session.',
         'authentication-required': 'Sign in required.', failed: 'Failed to update message. Try again.',
       },
     };
+    const zhErrorCodes = new Map(Object.entries(strings.zh).map(([key, value]) => [value, key]));
     const messageSeat = '[data-slot="conversation.chat.user.before"]';
     const editingRow = `div:has(> ${messageSeat} > .dsh-revision-editor)`;
     const originalContent = `${editingRow} > ${messageSeat} + *`;
@@ -207,9 +220,9 @@ window.__ModuleLoader__.load({
       x: ['M18 6l-12 12', 'M6 6l12 12'],
     };
 
-    function TablerIcon({ name, size = 16 }) {
+    function TablerIcon({ name, size = 16, strokeWidth = 2 }) {
       return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
-        strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', focusable: 'false', 'aria-hidden': true },
+        strokeWidth, strokeLinecap: 'round', strokeLinejoin: 'round', focusable: 'false', 'aria-hidden': true },
       tablerPaths[name].map(d => h('path', { d, key: d })));
     }
 
@@ -266,12 +279,58 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function resyncSessionView(sessions, sessionId, binding) {
-      const { manager } = sessions;
+    function clearSessionProjections(manager, sessionId, projections) {
       manager.projectionInflight?.get(sessionId)?.controller.abort();
       manager.projectionInflight?.delete(sessionId);
       manager.projectionLoads?.delete(sessionId);
-      binding.session.projections.clear();
+      projections?.clear?.();
+    }
+
+    const inheritedWindows = new WeakMap();
+    const inheritedNodes = new WeakMap();
+    const emptySubscribe = () => () => {};
+
+    function inheritedBoundary(eventSource) {
+      const window = eventSource?.getSnapshot();
+      if (!window) return -1;
+      const previous = inheritedWindows.get(eventSource);
+      if (previous?.revision === window.revision) return previous.boundary;
+      const change = window.change;
+      const incremental = previous?.revision + 1 === window.revision && change?.kind !== 'replace';
+      let boundary = incremental ? previous.boundary : -1;
+      const entries = incremental ? change?.entries : window.entries;
+      for (const { event } of entries ?? []) {
+        if (event.type === 'session/end-seed' && event.data?.inherited === true) boundary = Math.max(event.seq, boundary);
+      }
+      inheritedWindows.set(eventSource, { revision: window.revision, boundary });
+      return boundary;
+    }
+
+    function isInheritedMessage(nodes, source, boundary) {
+      if (!nodes || boundary < 0) return false;
+      // The native store identity survives history pagination. Its values
+      // snapshot changes when new rows become available.
+      const values = nodes.values();
+      let indexed = inheritedNodes.get(values);
+      if (indexed?.boundary !== boundary) {
+        const sources = new Map();
+        for (const node of values) {
+          if (node.kind !== 'user') continue;
+          const own = node.data.seq >= boundary;
+          sources.set(node.data.source, own || sources.get(node.data.source) === true);
+        }
+        indexed = { boundary, sources };
+        inheritedNodes.set(values, indexed);
+      }
+      return indexed.sources.get(source) === false;
+    }
+
+    function isEditableSessionMessage({ allowed, subagent, inherited }) {
+      return Boolean(allowed) && !subagent && !inherited;
+    }
+
+    async function resyncSessionView(sessions, sessionId, binding) {
+      clearSessionProjections(sessions.manager, sessionId, binding.session.projections);
       await binding.session.resync();
     }
 
@@ -282,7 +341,90 @@ window.__ModuleLoader__.load({
       if (typeof remove !== 'function' || typeof add !== 'function') return undefined;
       const holds = new Map();
       const transitions = new WeakMap();
+      let childReloads = Promise.resolve();
       let disposed = false;
+
+      function reloadParentCatalogs(ids) {
+        if (disposed || !Array.isArray(ids) || ids.length === 0 || ids.length > 128) return childReloads;
+        // An older list pull also writes these stores. Let that specific pull
+        // settle before clearing the old sequence watermark.
+        const listBeforeRevision = manager.listInflight;
+        if (listBeforeRevision) {
+          childReloads = childReloads.then(() => listBeforeRevision).catch(() => {});
+        }
+        for (const id of new Set(ids)) {
+          if (typeof id !== 'string' || id.length === 0 || id.length > 2048) continue;
+          childReloads = childReloads.then(async () => {
+            if (disposed) return;
+            const store = manager.projectionStores?.get(id);
+            if (!store) return;
+            // A rewrite lowers the native projection watermark. List-only tabs
+            // keep this store without ever binding or opening the conversation.
+            clearSessionProjections(manager, id, store);
+            await manager.refreshProjections?.(id);
+          }).catch(() => {});
+        }
+        return childReloads;
+      }
+
+      function reloadChildren(rewritten, withdrawn, affectedParentIds) {
+        if (disposed) return childReloads;
+        reloadParentCatalogs(affectedParentIds);
+        const changes = new Map();
+        for (const [ids, removed] of [[rewritten, false], [withdrawn, true]]) {
+          if (!Array.isArray(ids) || ids.length > 127) continue;
+          for (const id of ids) {
+            if (typeof id === 'string' && id.length > 0 && id.length <= 2048) changes.set(id, removed);
+          }
+        }
+        if (changes.size > 127) return childReloads;
+        for (const [id, withdrawnChild] of changes) {
+          childReloads = childReloads.then(async () => {
+            if (disposed) return;
+            const binding = sessionView(sessions, id);
+            if (!binding) {
+              clearSessionProjections(manager, id, manager.projectionStores?.get(id));
+              return;
+            }
+            const { session } = binding;
+            const snapshot = session.getSnapshot();
+            if (snapshot.openState === 'cold' || (snapshot.removed && !withdrawnChild)) {
+              clearSessionProjections(manager, id, session.projections);
+              return;
+            }
+            let transition = transitions.get(binding);
+            if (withdrawnChild && !transition) {
+              transition = { removal: 0, addition: 0, scheduled: -1, work: Promise.resolve() };
+              transitions.set(binding, transition);
+            }
+            const removal = transition?.removal;
+            let addition = transition?.addition;
+            await resyncSessionView(sessions, id, binding);
+            if (!withdrawnChild) return;
+            const currentBinding = () => !disposed && sessions.binding(id) === binding && transition.removal === removal;
+            if (!currentBinding()) return;
+            const notFound = ({ openState, openError }) => openState === 'error'
+              && (openError?.code === 'subagent/not-found' || openError?.code === 'session/not-found');
+            let current = session.getSnapshot();
+            // An addition while the read is pending may refer to a replacement
+            // under the same ID. Discard stale absence and verify the new view.
+            if (notFound(current) && transition.addition !== addition) {
+              addition = transition.addition;
+              await resyncSessionView(sessions, id, binding);
+              if (!currentBinding()) return;
+              current = session.getSnapshot();
+            }
+            if (notFound(current) && transition.addition === addition) {
+              session.installWindow?.([], false);
+              session.handleRemoved?.();
+            } else if (current.openState === 'open' && session.removed === true) {
+              session.removed = false;
+              session.notifier?.markDirty();
+            }
+          }).catch(() => {});
+        }
+        return childReloads;
+      }
 
       const undoRemove = replaceMethod(manager, 'handleSessionRemoved', function (id) {
         const binding = sessionView(sessions, id);
@@ -309,6 +451,8 @@ window.__ModuleLoader__.load({
           }
           const result = add.call(this, summary);
           if (disposed || summary.agentAvailable !== true) return result;
+          const activeTransition = binding && transitions.get(binding);
+          if (activeTransition) activeTransition.addition++;
           const hold = holds.get(id);
           if (hold) {
             hold.added();
@@ -322,7 +466,7 @@ window.__ModuleLoader__.load({
           // generation, including when another tab performed the rewrite.
           let transition = transitions.get(binding);
           if (!transition) {
-            transition = { removal: 0, scheduled: -1, work: Promise.resolve() };
+            transition = { removal: 0, addition: 0, scheduled: -1, work: Promise.resolve() };
             transitions.set(binding, transition);
           }
           const removal = transition.removal;
@@ -356,6 +500,8 @@ window.__ModuleLoader__.load({
           throw new Error('reconnect-unavailable');
         }
         let removed = false;
+        let removalVersion = 0;
+        let resyncedRemoval = -1;
         let readded = false;
         let rebound = false;
         let released = false;
@@ -368,7 +514,7 @@ window.__ModuleLoader__.load({
           releaseComposer();
         };
         const hold = {
-          removed() { removed = true; readded = false; rebound = false; },
+          removed() { removed = true; removalVersion++; readded = false; rebound = false; },
           added() {
             if (!removed || readded) return;
             readded = true;
@@ -381,7 +527,7 @@ window.__ModuleLoader__.load({
             holds.delete(sessionId);
             notifyAddition?.();
             releaseComposer();
-            if (removed && !readded) manager.handleSessionRemoved(sessionId);
+            if (removed && !readded && resyncedRemoval !== removalVersion) manager.handleSessionRemoved(sessionId);
           },
         };
         holds.set(sessionId, hold);
@@ -401,23 +547,122 @@ window.__ModuleLoader__.load({
               });
             }
             if (released || sessions.binding(sessionId) !== binding) return;
+            const verifyingRemoval = removalVersion;
             await resyncSessionView(sessions, sessionId, binding);
             if (released || sessions.binding(sessionId) !== binding) return;
             const snapshot = session.getSnapshot();
-            if (snapshot.openState !== 'open' || snapshot.removed) throw new Error('syncing');
+            if (snapshot.openState !== 'open' || snapshot.removed || verifyingRemoval !== removalVersion) {
+              throw new Error('syncing');
+            }
+            resyncedRemoval = verifyingRemoval;
             rebind();
           },
         };
       }
 
+      function reloadOpenChildren() {
+        let batch = [];
+        for (const id of sessions.scopes?.keys?.() ?? []) {
+          const snapshot = sessionView(sessions, id)?.session.getSnapshot();
+          if (!snapshot?.subagent || snapshot.openState === 'cold') continue;
+          batch.push(id);
+          if (batch.length === 127) {
+            reloadChildren([], batch);
+            batch = [];
+          }
+        }
+        return reloadChildren([], batch);
+      }
+
+      function refreshAfterNotificationGap() {
+        let batch = [];
+        for (const [id, projection] of manager.projectionStores ?? []) {
+          if (!projection.values?.()?.subagentCatalog?.length) continue;
+          batch.push(id);
+          if (batch.length === 128) {
+            reloadParentCatalogs(batch);
+            batch = [];
+          }
+        }
+        reloadParentCatalogs(batch);
+        return reloadOpenChildren();
+      }
+
       return {
         holdSessionView,
+        reloadChildren,
+        refreshAfterNotificationGap,
+        eventSource: sessionId => sessions.binding?.(sessionId)?.eventSource,
         dispose() {
           disposed = true;
           for (const hold of holds.values()) hold.release();
           undoAdd();
           undoRemove();
         },
+      };
+    }
+
+    // The corresponding Host descriptor is in revision-notifications.js.
+    const revisionRemoteName = 'messageRevisionEvents';
+    const revisionRemotePackage = '@kabxx/dsh-message-revision';
+    const revisionCursorPattern = /^[\da-f-]{36}:\d{1,16}$/u;
+    function revisionCodec(name, validate) {
+      return { mode: 'strict', typeSymbol: `${revisionRemotePackage}#${name}`, create: () => ({ parse(value) {
+        if (!validate(value)) throw new TypeError(`Invalid revision notification ${name}`);
+        return value;
+      } }) };
+    }
+    const revisionEventsContribution = { package: revisionRemotePackage, descriptors: [{
+      id: `${revisionRemotePackage}#${revisionRemoteName}/watch`, service: revisionRemoteName,
+      namespace: revisionRemoteName, method: 'watch', invocation: { kind: 'direct' },
+      mode: 'stream', cancellation: { parameter: 'signal' },
+      parameters: [{ name: 'cursor', wire: 'cursor', source: 'json', codec: revisionCodec('Cursor', value =>
+        value === null || (typeof value === 'string' && revisionCursorPattern.test(value))) }],
+      result: revisionCodec('Notice', value => {
+        const ids = (items, limit = 127) => Array.isArray(items) && items.length <= limit
+          && items.every(id => typeof id === 'string' && id.length > 0 && id.length <= 2048);
+        return value && typeof value.cursor === 'string' && revisionCursorPattern.test(value.cursor)
+          && (value.type === 'reset' || (value.type === 'revision' && ids(value.rewrittenChildren)
+            && ids(value.withdrawnChildren) && value.rewrittenChildren.length + value.withdrawnChildren.length <= 127
+            && (value.affectedParentIds === undefined || ids(value.affectedParentIds, 128))));
+      }),
+    }] };
+
+    function connectRevisionViews(views, remote, watch) {
+      let disposed = false;
+      let stream;
+      let retry;
+      let delay = 1000;
+      let cursor = null;
+      async function connect() {
+        if (disposed) return;
+        try {
+          stream = remote.$stream({
+            name: 'message revision history changes',
+            open: signal => watch(cursor, signal),
+            ended: () => new Error('Message revision history stream ended'),
+          });
+          for await (const item of stream) {
+            if (disposed) return;
+            const change = item.value;
+            if (change.type === 'reset') await views.refreshAfterNotificationGap();
+            else await views.reloadChildren(change.rewrittenChildren, change.withdrawnChildren, change.affectedParentIds);
+            if (disposed) return;
+            cursor = change.cursor;
+            delay = 1000;
+            item.accept();
+          }
+        } catch { /* A terminal failure may be temporary, such as a Host plugin reload. */ }
+        if (!disposed) {
+          retry = setTimeout(connect, delay);
+          delay = Math.min(delay * 2, 30_000);
+        }
+      }
+      void connect();
+      return async () => {
+        disposed = true;
+        clearTimeout(retry);
+        await stream?.dispose();
       };
     }
 
@@ -535,18 +780,32 @@ window.__ModuleLoader__.load({
           const snapshot = directory.getSnapshot();
           if (previous !== snapshot) {
             previous = snapshot;
-            overlay = { ...snapshot, current: selection };
+            const entry = snapshot.groups.find(group => group.id === selection.provider)
+              ?.models.find(model => model.id === selection.model);
+            const reasoning = entry?.reasoning;
+            const effort = selection.reasoningEffort ?? reasoning?.defaultEffort;
+            overlay = {
+              ...snapshot, current: selection, routable: snapshot.routable === null ? null : entry !== undefined,
+              retainedEffort: effort === undefined ? undefined : reasoning?.efforts.find(level => level.id === effort)?.name ?? effort,
+            };
           }
           return overlay;
         },
       };
     }
 
-    function NativeEditor({ edit, dismiss, cancelLabel, renderSlot, t, ...props }) {
+    function NativeEditor({ edit, cancel, cancelLabel, requestPending, renderSlot, t, ...props }) {
       const { shell, useDraft, useNotices, useLexicon, useBusyEnter, useStopShortcut,
         useFileUploads, retained, conversation, imageService, uploaded, registerFileIntake } = edit.composer;
       const phase = useDraft(state => state.phase);
-      const pending = phase === 'sending' || phase === 'adjudicating' || phase === 'submitting';
+      const pending = requestPending || phase === 'sending' || phase === 'adjudicating' || phase === 'submitting';
+      const locked = pending || props.disabled;
+      const editingLocked = () => locked || edit.isSubmitting();
+      // Voice transcription can finish after a send, even when the control is locked.
+      const activityActions = useMemo(() => ({
+        ...shell.actions,
+        insertText: (text, span) => !edit.isSubmitting() && shell.actions.insertText(text, span),
+      }), [edit, shell]);
       const [model, setModel] = useState(edit.settings.model);
       const [permission, setPermission] = useState(edit.settings.permissionPreset);
       const [previews, setPreviews] = useState({});
@@ -586,7 +845,7 @@ window.__ModuleLoader__.load({
       }, [conversation, retained, previews]);
       function addFiles(files, directories) {
         if (directories?.size > 0) return edit.labels.fileDirectory;
-        if (props.disabled || pending || typeof conversation?.createDrafts !== 'function') {
+        if (editingLocked() || typeof conversation?.createDrafts !== 'function') {
           return edit.labels.fileUnavailable;
         }
         const drafts = [];
@@ -604,7 +863,7 @@ window.__ModuleLoader__.load({
         return edit.labels.fileUnavailable;
       }
       function removeAttachment(id) {
-        if (props.disabled || pending || !shell.removeAttachment(id)) return;
+        if (editingLocked() || !shell.removeAttachment(id)) return;
         if (uploaded.delete(id)) conversation.releaseDraftAttachment(id);
       }
       const usePermissionProjection = (key, select) => props.useProjection(key, value => {
@@ -620,6 +879,7 @@ window.__ModuleLoader__.load({
         if (name === 'conversation.input.permission') return renderSlot(name, {
           ...owner, useProjection: usePermissionProjection,
           select: async preset => {
+            if (editingLocked()) return false;
             edit.settings.permissionPreset = preset;
             setPermission(preset);
             return true;
@@ -630,6 +890,7 @@ window.__ModuleLoader__.load({
           ...(modelDirectory === undefined ? { locked: true } : {
             directory: modelDirectory,
             select: async selection => {
+              if (editingLocked()) return { ok: false, error: { code: 'revision/busy', message: t('busy') } };
               edit.settings.model = selection;
               setModel(selection);
               return { ok: true, value: undefined };
@@ -637,7 +898,7 @@ window.__ModuleLoader__.load({
           }),
         });
         if (name === 'conversation.input.activity') {
-          return renderSlot(name, { ...owner, inputActions: shell.actions });
+          return renderSlot(name, { ...owner, inputActions: activityActions });
         }
         if (name === 'conversation.input.plan') return renderSlot(name, { ...owner, locked: true });
         if (name === 'conversation.composer.dock') return renderSlot(name, owner);
@@ -670,6 +931,7 @@ window.__ModuleLoader__.load({
       const uploadAllowed = props.useAccess('fileUploads/upload') !== false;
       return h('div', {
         className: 'dsh-revision-editor',
+        'aria-busy': requestPending || undefined,
         onDragEnterCapture: event => targetFileDrag(event),
         onDragOverCapture: event => targetFileDrag(event),
         onDropCapture: event => targetFileDrag(event, true),
@@ -679,18 +941,20 @@ window.__ModuleLoader__.load({
             || !event.target.closest('[contenteditable], .dsh-revision-cancel, .dsh-revision-text-part textarea')) return;
           event.preventDefault();
           event.stopPropagation();
-          if (!pending) dismiss();
+          if (!pending) cancel();
         },
       }, edit.additionalText.map((value, index) => h('label', {
         key: index, className: 'dsh-revision-text-part',
       }, `${edit.labels.textPart} ${index + 2}`, h('textarea', {
-        defaultValue: value, disabled: pending || props.disabled,
+        defaultValue: value, disabled: locked,
         onChange: event => {
+          if (editingLocked()) return;
           edit.additionalText[index] = event.currentTarget.value;
           setPartsVersion(version => version + 1);
         },
       }))), h(edit.native.component, {
         ...props,
+        disabled: locked,
         t: (key, ...args) => t(key === 'input.commands' ? 'input.file' : key, ...args),
         variant: 'composer', occurrence: 'embedded',
         renderSlot: renderEditorSlot, useInput: useDraft, inputActions: shell.actions,
@@ -698,13 +962,13 @@ window.__ModuleLoader__.load({
         useBusyEnter, useStopShortcut, useFileUploads: useCombinedUploads,
         registerFileIntake, resolveDraftAttachments, removeAttachment,
         addFiles: canUpload ? addFiles : undefined,
-        retryFileUpload: id => { if (uploaded.has(id)) conversation.retryFileUpload(props.sessionId, id); },
-        toggleCommandMenu: canUpload && uploadAllowed ? () => shell.pickFiles() : undefined,
+        retryFileUpload: id => { if (!editingLocked() && uploaded.has(id)) conversation.retryFileUpload(props.sessionId, id); },
+        toggleCommandMenu: canUpload && uploadAllowed ? () => { if (!editingLocked()) shell.pickFiles(); } : undefined,
         retry: undefined, stop: undefined,
         accessory: h('button', { type: 'button', className: 'dsh-revision-cancel', disabled: pending,
-          title: cancelLabel, 'aria-label': cancelLabel, onClick: () => dismiss() }, h(TablerIcon, { name: 'x' })),
-      }), sendRemainingText && h('button', { type: 'button', disabled: pending || props.disabled,
-        onClick: () => void edit.submit(draftText, draftAttachments),
+          title: cancelLabel, 'aria-label': cancelLabel, onClick: cancel }, h(TablerIcon, { name: 'x' })),
+      }), sendRemainingText && h('button', { type: 'button', disabled: locked,
+        onClick: () => { if (!editingLocked()) void edit.submit(draftText, draftAttachments); },
       }, edit.labels.sendPart));
     }
 
@@ -714,6 +978,18 @@ window.__ModuleLoader__.load({
         const lifetime = new AbortController();
         let activeEditor;
         let sessionViews;
+        const sessionViewListeners = new Set();
+        const readSessionViews = () => sessionViews;
+        const observeSessionViews = listener => {
+          sessionViewListeners.add(listener);
+          return () => sessionViewListeners.delete(listener);
+        };
+        function setSessionViews(next) {
+          if (sessionViews === next) return;
+          sessionViews = next;
+          for (const listener of sessionViewListeners) listener();
+        }
+        let pendingUnmount = Promise.resolve();
         let submitting = false;
         const savedDrafts = new Map();
         const draftListeners = new Set();
@@ -761,12 +1037,18 @@ window.__ModuleLoader__.load({
         let composerFactoryLive = false;
 
         async function requestRevision(payload) {
-          const response = await fetch('/api/message-revision', {
-            method: 'POST', credentials: 'same-origin', signal: lifetime.signal,
-            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-          });
-          const result = await response.json().catch(() => null);
+          let response;
+          try {
+            response = await fetch('/api/message-revision', {
+              method: 'POST', credentials: 'same-origin', signal: lifetime.signal,
+              headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+            });
+          } catch (cause) {
+            throw Object.assign(new Error('deliveryUnknown', { cause }), { deliveryUnknown: true });
+          }
           if (response.status === 401 || response.status === 403) throw new Error('authentication-required');
+          const result = await response.json().catch(() => null);
+          if (result === null) throw Object.assign(new Error('deliveryUnknown'), { deliveryUnknown: true });
           if (!response.ok || result?.ok !== true) {
             throw Object.assign(new Error('failed'), {
               hostError: typeof result?.error === 'string' ? result.error : '',
@@ -776,30 +1058,58 @@ window.__ModuleLoader__.load({
           return result;
         }
 
-        function RevisionAction({ t, matched, sessionId, useChat, useSession, useAccess, renderFactorySlot }) {
-          const allowed = useAccess('session/prompt');
+        const ownerAccessAction = 'settings/describe';
+
+        function RevisionAction({ t, matched, sessionId, useChat, useSession, useSessions, useAccess, useRemoteAccess, renderFactorySlot }) {
+          // Exact Host routes (/api/message-revision) admit only the Host owner.
+          // Core owner-only endpoints stay excluded from LiveShare viewer grants.
+          const owner = useRemoteAccess(ownerAccessAction);
+          const canPrompt = useAccess('session/prompt');
+          const canUpdateQueue = useAccess('session/updateQueue');
+          const allowed = owner && canPrompt && canUpdateQueue;
+          const subagentAddress = useSession(s => s.subagent != null) ?? false;
+          const subagentOrigin = useSessions(s => s.byId?.[sessionId]?.origin === 'subagent') ?? false;
+          const subagent = subagentAddress || subagentOrigin;
           const status = useSession(s => s.removed || s.openState !== 'open' ? 'unavailable'
             : s.running || s.pendingSubmissions.length > 0 ? 'busy' : 'idle');
           const busy = status === 'busy';
           const nodes = useChat(s => s.nodes);
+          const views = useSyncExternalStore(observeSessionViews, readSessionViews);
+          const eventSource = views?.eventSource(sessionId);
+          const subscribeToHistory = useCallback(listener => eventSource?.subscribe(listener) ?? emptySubscribe(), [eventSource]);
+          const readInheritedBoundary = useCallback(() => inheritedBoundary(eventSource), [eventSource]);
+          const inherited = useSyncExternalStore(subscribeToHistory, readInheritedBoundary);
+          const inheritedMessage = isInheritedMessage(nodes, matched, inherited);
+          const editable = isEditableSessionMessage({ allowed, subagent, inherited: inheritedMessage });
+          const editableRef = useRef(editable);
+          editableRef.current = editable;
           const savedVersion = useSyncExternalStore(observeDrafts, readDraftVersion);
           const [edit, setEdit] = useState(null);
           const [opening, setOpening] = useState(false);
+          const [requestPending, setRequestPending] = useState(false);
           const [tooltipDismissed, setTooltipDismissed] = useState(false);
           const pencil = useRef(null);
           const restoreFocus = useRef(false);
           const pending = useRef(false);
-          const owner = useRef(Symbol());
+          const ownerClaim = useRef(Symbol());
           const draft = useRef(null);
           useEffect(() => {
             setEdit(null);
             setOpening(false);
             return () => {
-              if (activeEditor === owner.current) activeEditor = undefined;
+              if (activeEditor === ownerClaim.current) activeEditor = undefined;
               draft.current?.dispose();
               draft.current = null;
             };
           }, [sessionId, matched]);
+          useLayoutEffect(() => {
+            if (editable) return;
+            setEdit(null);
+            setOpening(false);
+            if (activeEditor === ownerClaim.current) activeEditor = undefined;
+            draft.current?.dispose();
+            draft.current = null;
+          }, [editable]);
           useLayoutEffect(() => {
             if (!edit && restoreFocus.current) {
               restoreFocus.current = false;
@@ -807,20 +1117,21 @@ window.__ModuleLoader__.load({
             }
           }, [edit]);
           useEffect(() => {
-            if (!allowed || status !== 'idle' || edit || opening || activeEditor !== undefined || submitting) return;
+            if (!editable || status !== 'idle' || edit || opening || activeEditor !== undefined || submitting) return;
             const node = messageInRow(pencil.current);
             if (!node) return;
             const saved = savedDrafts.get(revisionDraftKey(sessionId, node.data.messageId));
             if (saved?.reopenInView !== window.location.href) return;
             saved.reopenInView = undefined;
             void openEditor(node, saved);
-          }, [allowed, status, edit, opening, nodes, matched, sessionId, savedVersion]);
-          if (!allowed) return null;
+          }, [editable, status, edit, opening, nodes, matched, sessionId, savedVersion]);
+          if (!editable) return null;
 
           function errorMessage(error) {
             const message = typeof error?.hostError === 'string' ? error.hostError.trim() : '';
-            const code = Object.hasOwn(strings.zh, message) ? message
-              : Object.hasOwn(strings.zh, error?.message) ? error.message : null;
+            const code = (Object.hasOwn(strings.zh, message) ? message : zhErrorCodes.get(message))
+              ?? (Object.hasOwn(strings.zh, error?.message) ? error.message : zhErrorCodes.get(error?.message))
+              ?? null;
             return code ? t(code) : (message.slice(0, 240) || t('failed'));
           }
 
@@ -848,12 +1159,16 @@ window.__ModuleLoader__.load({
             if (!Array.isArray(content)) { notify(t('unsupported')); return; }
             const native = nativeComposerEntry(ctx.slots);
             if (!native || !composerFactoryLive) { notify(t('composer-unavailable')); return; }
-            const claim = owner.current = Symbol();
+            const claim = ownerClaim.current = Symbol();
             activeEditor = claim;
             setOpening(true);
             try {
               const result = await requestRevision({ sessionId, messageId: node.data.messageId });
-              if (activeEditor !== claim || lifetime.signal.aborted) return;
+              if (activeEditor !== claim || !editableRef.current || lifetime.signal.aborted) {
+                if (activeEditor === claim) activeEditor = undefined;
+                setOpening(false);
+                return;
+              }
               if (typeof result.revision !== 'string' || typeof result.text !== 'string') throw new Error('failed');
               if (result.toolbarRevision !== 1 || !Array.isArray(result.attachments)
                 || !Array.isArray(result.textParts) || result.textParts.some(part => typeof part !== 'string')
@@ -874,6 +1189,7 @@ window.__ModuleLoader__.load({
                   .find(entry => entry.locale === 'model')?.inject?.(sessionId)?.directory,
                 readFileDrag: transfer => ctx.get('fileDrag')?.read(transfer),
                 labels: { fileDirectory: t('fileDirectory'), fileUnavailable: t('fileUnavailable'), textPart: t('textPart'), sendPart: t('sendPart') },
+                isSubmitting: () => pending.current,
                 submit: (text, attachmentIds) => submit(edit, text, attachmentIds, claim),
               };
               edit.composer = openDraft(ctx, native, sessionId, firstText, result.attachments,
@@ -885,7 +1201,11 @@ window.__ModuleLoader__.load({
               setOpening(false);
               setEdit(edit);
             } catch (error) {
-              if (activeEditor !== claim || lifetime.signal.aborted) return;
+              if (activeEditor !== claim || !editableRef.current || lifetime.signal.aborted) {
+                if (activeEditor === claim) activeEditor = undefined;
+                setOpening(false);
+                return;
+              }
               activeEditor = undefined;
               setOpening(false);
               notify(errorMessage(error));
@@ -893,12 +1213,16 @@ window.__ModuleLoader__.load({
           }
 
           function dismiss(restore = true) {
-            if (activeEditor === owner.current) activeEditor = undefined;
+            if (activeEditor === ownerClaim.current) activeEditor = undefined;
             restoreFocus.current = restore === true;
             const composer = draft.current;
             draft.current = null;
             setEdit(null);
             composer?.dispose();
+          }
+
+          function cancel() {
+            if (!pending.current) dismiss();
           }
 
           async function submit(edit, text, attachmentIds, claim) {
@@ -908,7 +1232,7 @@ window.__ModuleLoader__.load({
             }
             const textParts = edit.additionalText.length ? [text, ...edit.additionalText] : undefined;
             if (textParts) text = textParts.join('');
-            if (submitting || pending.current || activeEditor !== claim || (!text.trim() && attachmentIds.length === 0)) {
+            if (submitting || pending.current || activeEditor !== claim || !editableRef.current || (!text.trim() && attachmentIds.length === 0)) {
               return { kind: 'error' };
             }
             const { retained, conversation } = edit.composer;
@@ -955,8 +1279,10 @@ window.__ModuleLoader__.load({
             const view = window.location.href;
             submitting = true;
             pending.current = true;
+            setRequestPending(true);
             let reconnect;
             let restoreDraft = false;
+            let deliveryUnknown = false;
             let savedForRetry = false;
             const inView = () => !lifetime.signal.aborted && window.location.href === view;
             try {
@@ -968,6 +1294,7 @@ window.__ModuleLoader__.load({
                   toolbarRevision: 1, text, textParts, expectedRevision: edit.revision,
                    removedAttachments, receiptIds, ...edit.settings });
               } catch (error) {
+                deliveryUnknown = error.deliveryUnknown === true;
                 if (error.reconnect || reconnect.removed) {
                   restoreDraft = true;
                   await reconnect.reconnect().catch(() => {});
@@ -993,7 +1320,7 @@ window.__ModuleLoader__.load({
               }
               return { kind: 'success' };
             } catch (error) {
-              savedForRetry = !lifetime.signal.aborted && (restoreDraft || draft.current !== edit.composer);
+              savedForRetry = !lifetime.signal.aborted && editableRef.current && (deliveryUnknown || restoreDraft || draft.current !== edit.composer);
               if (savedForRetry && activeEditor === claim) dismiss(false);
               if (inView()) notify(savedForRetry ? `${errorMessage(error)} ${t('draftSaved')}` : errorMessage(error));
               return { kind: 'error' };
@@ -1003,7 +1330,8 @@ window.__ModuleLoader__.load({
                 reconnect?.release();
               } finally {
                 submitting = false;
-                if (savedForRetry) keepDraft(edit.key, { ...saved, reopenInView: inView() ? view : undefined });
+                setRequestPending(false);
+                if (savedForRetry) keepDraft(edit.key, { ...saved, reopenInView: inView() && (!deliveryUnknown || restoreDraft) ? view : undefined });
               }
             }
           }
@@ -1016,22 +1344,13 @@ window.__ModuleLoader__.load({
               onFocus: () => setTooltipDismissed(false),
               onPointerLeave: () => setTooltipDismissed(false),
               onKeyDown: event => { if (event.key === 'Escape') setTooltipDismissed(true); },
-            }, h(TablerIcon, { name: 'pencil' })),
+            }, h(TablerIcon, { name: 'pencil', strokeWidth: 1.5 })),
             edit && renderFactorySlot(editorFactory, {
-              edit, dismiss, cancelLabel: t('cancel'), disabled: busy,
+              edit, cancel, requestPending, cancelLabel: t('cancel'), disabled: busy,
             }));
         }
 
         ctx.effect(() => () => lifetime.abort());
-        ctx.inject(['sessions'], scoped => scoped.effect(() => {
-          const views = watchSessionViews(sessionRuntime(scoped));
-          sessionViews = views;
-          return () => {
-            if (sessionViews === views) sessionViews = undefined;
-            views?.dispose();
-          };
-        }));
-        ctx.effect(() => ctx.locale.register(locale, strings));
         // The same native child seats remain available to the registered native bar.
         const composerChildren = {
           'conversation.input.attachments': { kind: 'single', scope: 'session-maybe' },
@@ -1043,24 +1362,59 @@ window.__ModuleLoader__.load({
           'conversation.input.right': { kind: 'list', scope: 'session' },
           'conversation.composer.dock': { kind: 'list', scope: 'session' },
         };
-        ctx.slots.inject(composerSlot, () => {
-          // rc.5 registers and tears down only own child declarations, but the
-          // Factory renderer resolves their specs by lookup. Borrow the already
-          // live slots without owning them so unloading leaves the host intact.
-          const borrowedChildren = Object.freeze(Object.create(Object.freeze(composerChildren)));
-          const dispose = ctx.slots.registerFactory({
-            name: editorFactory, scope: 'session', locale: 'conversation', children: borrowedChildren,
-          }, NativeEditor);
-          composerFactoryLive = true;
-          return () => { composerFactoryLive = false; dispose(); };
-        });
-        ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-          name: 'shell.overlay', id: 'message-revision.styles', locale,
-        }, props => h(Fragment, null, h('style', null, css), h(Feedback, props))));
-        ctx.slots.inject('conversation.chat.user.before', () => ctx.slots.register({
-          name: 'conversation.chat.user.before', locale, order: 10000,
-          select: ({ kind, source }) => kind === 'user' && source?.kind === 'user' ? source : null,
-        }, RevisionAction));
+        // Only the Host owner can call /api/message-revision or watch revision events.
+        ctx.inject(['remoteAccess'], accessScope => accessScope.remoteAccess.whenAccess(ownerAccessAction, function* () {
+          const sessions = accessScope.inject(['sessions'], scoped => scoped.effect(() => {
+            const views = watchSessionViews(sessionRuntime(scoped));
+            setSessionViews(views);
+            if (views) scoped.inject(['remote'], remoteScope => remoteScope.effect(async () => {
+              await pendingUnmount.catch(() => {});
+              if (lifetime.signal.aborted || sessionViews !== views) return undefined;
+              const unmount = await remoteScope.remote.$mount(revisionEventsContribution);
+              let subscription;
+              try {
+                subscription = remoteScope.inject([`remote.${revisionRemoteName}`], ready => ready.effect(() =>
+                  connectRevisionViews(views, ready.remote, (cursor, signal) => ready.remote[revisionRemoteName].watch(cursor, signal))));
+              } catch (error) {
+                const cleanup = Promise.resolve().then(() => unmount());
+                pendingUnmount = cleanup;
+                await cleanup;
+                throw error;
+              }
+              return () => {
+                const cleanup = (async () => {
+                  try { await subscription.dispose(); } finally { await unmount(); }
+                })();
+                pendingUnmount = cleanup;
+                return cleanup;
+              };
+            }));
+            return () => {
+              if (sessionViews === views) setSessionViews(undefined);
+              views?.dispose();
+            };
+          }));
+          yield () => { void sessions.dispose(); };
+          yield accessScope.locale.register(locale, strings);
+          yield accessScope.slots.inject(composerSlot, () => {
+            // rc.5 registers and tears down only own child declarations, but the
+            // Factory renderer resolves their specs by lookup. Borrow the already
+            // live slots without owning them so unloading leaves the host intact.
+            const borrowedChildren = Object.freeze(Object.create(Object.freeze(composerChildren)));
+            const dispose = accessScope.slots.registerFactory({
+              name: editorFactory, scope: 'session', locale: 'conversation', children: borrowedChildren,
+            }, NativeEditor);
+            composerFactoryLive = true;
+            return () => { composerFactoryLive = false; dispose(); };
+          });
+          yield accessScope.slots.inject('shell.overlay', () => accessScope.slots.register({
+            name: 'shell.overlay', id: 'message-revision.styles', locale,
+          }, props => h(Fragment, null, h('style', null, css), h(Feedback, props))));
+          yield accessScope.slots.inject('conversation.chat.user.before', () => accessScope.slots.register({
+            name: 'conversation.chat.user.before', locale, order: 10000,
+            select: ({ kind, source }) => kind === 'user' && source?.kind === 'user' ? source : null,
+          }, RevisionAction));
+        }));
       },
     };
   },

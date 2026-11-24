@@ -12,9 +12,7 @@ async function records(persistence, id) {
   try { return (await handle.read()).events; } finally { await handle.close(); }
 }
 
-test('late V3 migration catalog facts preserve existing children while a later child is withdrawn', {
-  skip: process.platform === 'win32',
-}, async t => {
+test('late V3 migration catalog facts preserve existing children while a later child is withdrawn', async t => {
   const { persistence, bytes } = await childFixture(t, {
     parent: { createdAt: 10, events: [
       ...turn(1, 20),

@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile, readdir } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, truncate, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import manifest from '../package.json' with { type: 'json' };
+import { acquireNativeLease } from '../src/native-lease.js';
 import { recoverStoredSessions, rewriteStoredSession } from '../src/revision.js';
 import { catalog, childFixture, turn } from './child-fixture.js';
+import { assertTerminated, nativeLocksAvailable, skipWithoutNativeLocks, spawnTestEnv } from './platform-fixture.js';
 
 const moduleUrl = new URL('../src/revision.js', import.meta.url).href;
-const journalPath = parentPath => join(dirname(parentPath), 'plugins', '@kabxx', 'dsh-message-revision', 'v0.1.0');
+const journalPath = parentPath => join(dirname(parentPath), 'plugins', ...manifest.name.split('/'), `v${manifest.version}`);
 const input = { sessionId: 'parent', messageId: 'question-2', text: 'updated question' };
 
 async function fixture(t) {
@@ -24,21 +27,55 @@ async function fixture(t) {
 
 const worker = `
   import { readFile, stat } from 'node:fs/promises';
-  import { spawnSync } from 'node:child_process';
   import { createRequire, syncBuiltinESMExports } from 'node:module';
-  import { basename } from 'node:path';
+  import { basename, join } from 'node:path';
   const fs = createRequire(import.meta.url)('node:fs/promises');
   const [entry, mode, entries, input] = process.argv.slice(1);
   const locations = new Map(JSON.parse(entries).map(x => [x.id, x.path]));
+  const stripNs = value => value.startsWith('\\\\\\\\?\\\\') ? value.slice(4) : value;
+  const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
   const actualRename = fs.rename;
   const actualRm = fs.rm;
+  function beforeMove(to) {
+    const clean = stripNs(to);
+    if (basename(clean) === 'rewrite' && mode === 'preparing') process.kill(process.pid, 'SIGKILL');
+    if (basename(clean) === 'committed' && mode === 'commit-failed') throw new Error('injected commit marker failure');
+    if (samePath(clean, locations.get('parent')) && mode === 'before-publish') process.kill(process.pid, 'SIGKILL');
+  }
+  function afterMove(to) {
+    const clean = stripNs(to);
+    if (samePath(clean, locations.get('parent')) && mode === 'after-publish') process.kill(process.pid, 'SIGKILL');
+  }
   fs.rename = async (from, to) => {
-    if (basename(to) === 'rewrite' && mode === 'preparing') process.kill(process.pid, 'SIGKILL');
-    if (basename(to) === 'committed' && mode === 'commit-failed') throw new Error('injected commit marker failure');
-    if (to === locations.get('parent') && mode === 'before-publish') process.kill(process.pid, 'SIGKILL');
+    beforeMove(to);
     await actualRename(from, to);
-    if (to === locations.get('parent') && mode === 'after-publish') process.kill(process.pid, 'SIGKILL');
+    afterMove(to);
   };
+  if (process.platform === 'win32') {
+    const { loadHostKoffi } = await import(new URL('./platform.js', entry).href);
+    const koffi = loadHostKoffi();
+    if (koffi) {
+      const actualLoad = koffi.load.bind(koffi);
+      koffi.load = name => {
+        const lib = actualLoad(name);
+        if (String(name).toLowerCase() !== 'kernel32.dll') return lib;
+        const actualFunc = lib.func.bind(lib);
+        return {
+          ...lib,
+          func(...args) {
+            const fn = actualFunc(...args);
+            if (!(String(args[0]).includes('MoveFileExW') || args[1] === 'MoveFileExW')) return fn;
+            return (from, to, flags) => {
+              beforeMove(to);
+              const ok = fn(from, to, flags);
+              if (ok !== 0) afterMove(to);
+              return ok;
+            };
+          },
+        };
+      };
+    }
+  }
   fs.rm = async (path, options) => {
     if (mode === 'cleanup-failed' && basename(path).startsWith('discard-')) throw new Error('injected cleanup failure');
     return actualRm(path, options);
@@ -73,7 +110,7 @@ const worker = `
 
 async function subprocess(mode, known) {
   const proc = spawn(process.execPath, ['--input-type=module', '-e', worker, moduleUrl, mode, JSON.stringify(known), JSON.stringify(input)],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
+    { stdio: ['ignore', 'pipe', 'pipe'], env: spawnTestEnv() });
   let stdout = '';
   let stderr = '';
   proc.stdout.setEncoding('utf8').on('data', data => { stdout += data; });
@@ -88,7 +125,7 @@ for (const mode of ['before-publish', 'after-publish']) {
     const original = await readFile(parentPath);
     const originalChild = await readFile(childPath);
     const killed = await subprocess(mode, known);
-    assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+    assertTerminated(killed.code, killed.signal, killed.stderr);
     assert.equal(await persistence.stat('child'), undefined);
     const path = journalPath(parentPath);
     assert.deepEqual(await readFile(join(path, 'rewrite', 'original')), original);
@@ -111,17 +148,20 @@ for (const mode of ['before-publish', 'after-publish']) {
   });
 }
 
-test('startup removes abandoned preparation only under the original writer lock', async t => {
+test('startup removes abandoned preparation only under the original writer lock', {
+  skip: skipWithoutNativeLocks,
+}, async t => {
   const { persistence, known, parentPath, childPath, writers } = await fixture(t);
   const original = await readFile(parentPath);
   const originalChild = await readFile(childPath);
   const reply = await subprocess('preparing', known);
-  assert.equal(reply.signal, 'SIGKILL', reply.stderr);
+  assertTerminated(reply.code, reply.signal, reply.stderr);
   const path = journalPath(parentPath);
   const [preparing] = await readdir(path);
   assert.match(preparing, /^preparing-/u);
   const errors = [];
-  const held = await persistence.open('parent', 'write');
+  const held = nativeLocksAvailable
+    ? await acquireNativeLease(parentPath) : await persistence.open('parent', 'write');
   try {
     await recoverStoredSessions(persistence, { onError: (_, error) => errors.push(error) });
     assert.equal(errors[0]?.name, 'SessionAlreadyOwnedError');
@@ -135,6 +175,25 @@ test('startup removes abandoned preparation only under the original writer lock'
   assert.deepEqual(await readFile(parentPath), original);
   assert.deepEqual(await readFile(childPath), originalChild);
   assert.equal(writers.size, 0);
+});
+
+test('startup removes an interrupted preparation beside a large parent without loading its log', { skip: skipWithoutNativeLocks }, async t => {
+  const { persistence, parentPath, childPath } = await fixture(t);
+  const original = await readFile(parentPath);
+  const originalChild = await readFile(childPath);
+  const size = 300 * 1024 * 1024;
+  await truncate(parentPath, size);
+  const directory = journalPath(parentPath);
+  const preparation = join(directory, 'preparing-01234567-89ab-cdef-0123-456789abcdef');
+  await mkdir(join(preparation, 'artifacts'), { recursive: true });
+  await writeFile(join(preparation, 'artifacts', 'artifact-0.original'), original);
+  persistence.open = async () => assert.fail('Startup must not open the full native log for preparing debris');
+  const errors = [];
+  await recoverStoredSessions(persistence, { onError: (_, error) => errors.push(error) });
+  assert.deepEqual(errors, []);
+  assert.deepEqual(await readdir(directory), []);
+  assert.equal((await stat(parentPath)).size, size);
+  assert.deepEqual(await readFile(childPath), originalChild);
 });
 
 test('commit marker failure restores the original before any dispatch', async t => {
@@ -171,7 +230,7 @@ test('cleanup failure follows dispatch, reports a warning and remains safely ret
 test('startup recovery preserves data when parent ownership or history conflicts', async t => {
   const { persistence, known, parentPath, childPath } = await fixture(t);
   const killed = await subprocess('after-publish', known);
-  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  assertTerminated(killed.code, killed.signal, killed.stderr);
   const candidate = await readFile(parentPath);
   const held = await persistence.open('parent', 'write');
   const errors = [];

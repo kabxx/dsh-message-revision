@@ -23,7 +23,7 @@
     "icon.svg"
   ],
   "scripts": {
-    "check": "for f in src/*.js; do node --check \"$f\"; done",
+    "check": "node --input-type=module -e \"import { readdirSync } from 'node:fs'; import { join } from 'node:path'; import { spawnSync } from 'node:child_process'; const files = []; for (const root of ['src', 'test']) for (const entry of readdirSync(root, { withFileTypes: true, recursive: true })) if (entry.isFile() && entry.name.endsWith('.js')) files.push(join(entry.parentPath, entry.name)); files.sort(); if (files.length === 0) process.exit(1); for (const file of files) { const r = spawnSync(process.execPath, ['--check', file], { stdio: 'inherit' }); if (r.error) throw r.error; if (r.status || r.signal) process.exit(r.status || 1); }\"",
     "test": "node --test test/*.test.js"
   },
   "engines": {
@@ -37,7 +37,9 @@
     "client": {
       "platform": "web",
       "inject": [
+        "@deepseek-ai/dsh-api-remote-access",
         "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-session",
         "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }

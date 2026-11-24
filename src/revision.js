@@ -1,18 +1,27 @@
+import { cleanupRevisionCandidates } from './revision-candidates.js';
+import { acquireNativeLease } from './native-lease.js';
+import {
+  isCanonicalPath, isSamePath, isSupportedPlatform, pathKey, replaceFileDurable, resolveRolloutPath,
+} from './platform.js';
+import { decompressZstdConcat } from './rollout-stream.js';
+import { isProvisionalResumeMarker } from './rollback-events.js';
 import { randomUUID } from 'node:crypto';
-import { lstat, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { lstat, open, readFile, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
+import { setTimeout as wait } from 'node:timers/promises';
 import {
   cleanRewriteDebris, clearFailedCommitMarker, forgetRewriteJournal, hasPendingRewrite, listRewriteDebris, markRewriteCommitted,
   matchJournalRevision, prepareRewriteJournal, readRewriteJournals, readRewriteOriginal, restoreWithdrawnChildren,
-  retireRewriteJournal, stageWithdrawnChildren,
+  retireRewriteJournal, retrySettledRewriteRetirement, stageWithdrawnChildren,
 } from './rewrite-journal.js';
 import { promisify } from 'node:util';
-import { constants, zstdCompress, zstdDecompress } from 'node:zlib';
+import { constants, zstdCompress } from 'node:zlib';
 
 const compress = promisify(zstdCompress);
-const decompress = promisify(zstdDecompress);
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 const maxBytes = 256 * 1024 * 1024;
+const maxQueue = 4096;
+const maxCopies = 8192;
 const logName = /^session\.v4\.jsonl(?:\.zstd)?$/u;
 
 export class RevisionError extends Error {
@@ -32,36 +41,48 @@ export function planRevision(events, messageId, inheritedCount = 0) {
   let turn;
   let selected;
   let checkpoint;
-  const inputCopies = [];
-  for (const [index, event] of events.entries()) {
+  let inputCopies = [];
+  let index = 0;
+  for (const event of events) {
     requireRevision(event.seq === index, '会话日志的事件顺序不完整。');
     const data = event.data;
     if (event.type === 'agent/inbox/spliced') {
       const queue = queues[data.target];
       const count = data.removedCount ?? 0;
-      requireRevision(queue && Number.isSafeInteger(data.start) && data.start >= 0
+      requireRevision(Array.isArray(queue) && Number.isSafeInteger(data.start) && data.start >= 0
         && Number.isSafeInteger(count) && count >= 0 && data.start + count <= queue.length
-        && Array.isArray(data.inserted), '无法安全复原会话的消息队列。');
-      const inserted = data.inserted.map((message, offset) => ({ message, index, offset }));
-      for (const item of inserted) if (item.message.id === messageId) inputCopies.push(item);
+        && Array.isArray(data.inserted)
+        && queue.length - count + data.inserted.length <= maxQueue, '无法安全复原会话的消息队列。');
+      const inserted = data.inserted.map((message, offset) => {
+        requireRevision(typeof message?.id === 'string' && message.id.length <= 2048, '无法安全复原会话的消息队列。');
+        if (message.id !== messageId) return { id: message.id };
+        requireRevision(inputCopies.length < maxCopies, '同一消息的历史入队记录超出检查上限。');
+        const item = { message, index, offset };
+        inputCopies.push(item);
+        return { id: message.id, ...item };
+      });
       queue.splice(data.start, count, ...inserted);
     } else if (event.type === 'turn/start') {
-      requireRevision(turn === undefined, '会话日志中存在未关闭的回合。');
+      requireRevision(turn === undefined && Number.isSafeInteger(data?.turn), '会话日志中存在未关闭的回合。');
+      const candidate = queues['next-turn'][0];
       turn = {
         index,
         number: data.turn,
-        input: queues['next-turn'][0],
+        time: event.time,
+        input: candidate?.id === messageId ? candidate : undefined,
         queuedCount: queues['next-turn'].length,
         hasSteering: queues['next-step'].length > 0,
       };
     } else if (event.type === 'turn/end') {
-      requireRevision(turn?.number === data.turn, '会话日志的回合边界不完整。');
+      requireRevision(turn !== undefined && turn.number === data?.turn, '会话日志的回合边界不完整。');
       turn = undefined;
     } else if (event.type === 'user/message' && data?.id === messageId && data.source?.kind === 'user') {
       requireRevision(selected === undefined, '日志中找到了重复的用户消息。');
       selected = event;
       checkpoint = turn;
+      if (checkpoint) inputCopies = inputCopies.filter(item => item.index < checkpoint.index);
     }
+    index++;
   }
   requireRevision(turn === undefined, '回复生成中，请先停止或等待完成。');
   requireRevision(selected && checkpoint?.input?.message.id === messageId
@@ -76,7 +97,7 @@ export function planRevision(events, messageId, inheritedCount = 0) {
   return {
     cut: checkpoint.index,
     retainedInputs,
-    time: events[checkpoint.index].time,
+    time: checkpoint.time,
     message: checkpoint.input.message,
   };
 }
@@ -111,7 +132,7 @@ export function resolveRevisionText(message, { text, textParts }) {
   return [text];
 }
 
-function rewriteMessage(message, input, removed, added) {
+export function rewriteMessage(message, input, removed, added) {
   const retained = retainedRevisionAttachments(message, removed);
   const textParts = resolveRevisionText(message, input);
   requireRevision(input.text.trim() !== '' || retained.length > 0 || added.length > 0, '请输入消息内容或至少保留一个附件。');
@@ -143,22 +164,29 @@ function checkLocation(snapshot) {
   return path;
 }
 
+async function checkedRolloutPath(dshPath) {
+  const path = await resolveRolloutPath(dshPath);
+  requireRevision(path !== undefined, '会话日志路径异常。');
+  return path;
+}
+
 async function checkArtifact(path) {
   const identity = await lstat(path, { bigint: true });
-  requireRevision(identity.isFile() && !identity.isSymbolicLink() && await realpath(path) === path,
+  requireRevision(identity.isFile() && !identity.isSymbolicLink() && await isCanonicalPath(path),
     '会话日志路径异常。');
   requireRevision(identity.size <= maxBytes, '会话日志超出大小上限，无法编辑。');
   return identity;
 }
 
 async function openLocked(persistence, sessionId, snapshot) {
-  const path = checkLocation(snapshot);
+  const dshPath = checkLocation(snapshot);
+  const path = await checkedRolloutPath(dshPath);
   const identity = await checkArtifact(path);
   const handle = await persistence.open(sessionId, 'write');
   try {
     const current = await persistence.stat(sessionId);
-    requireRevision(handle.header.id === sessionId && checkLocation(current) === path
-      && current.revision === snapshot.revision, '会话状态已变更，请刷新后重试。');
+    requireRevision(handle.header.id === sessionId && isSamePath(checkLocation(current), dshPath)
+      && current.revision === snapshot.revision && isSamePath(await resolveRolloutPath(dshPath), path), '会话状态已变更，请刷新后重试。');
     const { events } = await handle.read(0);
     return { handle, path, identity, events, snapshot: current };
   } catch (error) {
@@ -170,7 +198,7 @@ async function openLocked(persistence, sessionId, snapshot) {
 async function encodeReplacement(source, plan, message, controls, restoredCatalog) {
   const compressed = source.path.endsWith('.zstd');
   const raw = await readFile(source.path);
-  const decoded = compressed ? await decompress(raw, { maxOutputLength: maxBytes }) : raw;
+  const decoded = compressed ? decompressZstdConcat(raw, { maxOutputLength: maxBytes }) : raw;
   const lines = utf8.decode(decoded).split('\n');
   requireRevision(lines.pop() === '' && lines.length === source.events.length + 1,
     '会话日志不完整，已取消编辑。');
@@ -305,7 +333,7 @@ async function replaceArtifact(source, buffers, beforeReplace, onPublished, stag
     await checkUnchanged(source);
     await beforeReplace?.();
     await checkUnchanged(source);
-    await rename(stage, source.path);
+    await replaceFileDurable(stage, source.path);
     pending = false;
     onPublished?.();
     if (process.platform !== 'win32') {
@@ -315,19 +343,6 @@ async function replaceArtifact(source, buffers, beforeReplace, onPublished, stag
   } finally {
     if (pending) await unlink(stage);
   }
-}
-
-function isProvisionalOpenEvent(event) {
-  // A failed initializer may have persisted settings or other native events.
-  // A turn or an accepted human input could belong to a different operation.
-  const { data } = event;
-  if (event.type === 'turn/start' || event.type === 'step/start'
-    || (event.type === 'user/message' && data.source?.kind === 'user')) return false;
-  if (event.type !== 'agent/inbox/spliced') return true;
-  return (data.removedCount ?? 0) === 0
-    ? data.inserted?.every(message => message.source?.kind !== 'user' && message.source?.kind !== 'retry')
-    : data.target === 'next-turn' && data.start === 0 && data.removedCount === 1
-      && data.inserted?.length === 0 && data.outcome === 'canceled';
 }
 
 async function recoverRewrite(source, journal, { canRollback, beforeCommit } = {}) {
@@ -340,7 +355,8 @@ async function recoverRewrite(source, journal, { canRollback, beforeCommit } = {
     return;
   }
   const retained = journal.intent.candidate.records;
-  requireRevision(source.events.length >= retained && source.events.slice(retained).every(isProvisionalOpenEvent),
+  requireRevision(source.events.length >= retained
+    && source.events.slice(retained).every(event => isProvisionalResumeMarker(event, retained)),
     '更新后的会话已有新增内容，无法自动回滚。');
   const original = await readRewriteOriginal(journal);
   await replaceArtifact(source, [original], async () => {
@@ -349,37 +365,140 @@ async function recoverRewrite(source, journal, { canRollback, beforeCommit } = {
   }, undefined, journal.directory);
 }
 
-/** Recover transactions left by a previous Host before admitting new rewrites. */
-export async function recoverStoredSessions(persistence, { beforeCommit, canRollback, onError } = {}) {
-  for (const snapshot of await persistence.list()) {
-    const { id } = snapshot.header;
-    try {
-      const journals = await readRewriteJournals(snapshot);
-      if (snapshot.location?.kind !== 'jsonl' || !isAbsolute(snapshot.location.path)) continue;
-      const { preparations, retired } = await listRewriteDebris(snapshot.location.path);
-      if (journals.length > 0 || preparations.length > 0) {
-        const source = await openLocked(persistence, id, snapshot);
-        try {
-          // The journal may have been retired between scanning and claiming the lock.
-          for (const journal of await readRewriteJournals(source.snapshot)) {
-            await recoverRewrite(source, journal, { beforeCommit, canRollback: () => canRollback?.(id) ?? true });
-            await retireRewriteJournal(journal);
-          }
-          await cleanRewriteDebris((await listRewriteDebris(source.path)).preparations);
-        } finally {
-          await source.handle.close();
-        }
+const recoveries = new Map();
+const recoveryRetryDelays = [100, 250, 500, 1_000, 2_000, 4_000];
+
+function recoverSessionRewrite(persistence, snapshot, { beforeCommit, canRollback, onError, restoreBoundedJournal, recoverDelivery } = {}) {
+  const { id } = snapshot.header;
+  const path = checkLocation(snapshot);
+  const key = pathKey(path);
+  const existing = recoveries.get(key);
+  if (existing) return existing;
+  const recovery = (async () => {
+    const [journal] = await readRewriteJournals(snapshot);
+    if (!journal) return false;
+    if (journal.intent.format === 2) {
+      if (journal.committed && journal.intent.delivery) {
+        recoverDelivery?.(journal);
+        return false;
       }
-      await cleanRewriteDebris(retired);
-    } catch (error) {
-      onError?.(id, error);
+      const retire = () => retireRewriteJournal(journal, { deferCleanup: true, onCleanupError: error => onError?.(id, error) });
+      if (journal.committed) {
+        await retire();
+        return false;
+      }
+      if (!restoreBoundedJournal) throw new RevisionError('当前无法恢复多会话编辑事务。');
+      await restoreBoundedJournal(journal, {
+        beforeCommit,
+        canRollback: () => [...journal.intent.artifacts, ...journal.intent.children]
+          .every(entry => canRollback?.(entry.id) ?? true),
+        afterRestore: retire,
+      });
+      return true;
+    }
+    const source = await openLocked(persistence, id, snapshot);
+    try {
+      // Only act on the journal still present after obtaining the native lock.
+      const [current] = await readRewriteJournals(source.snapshot);
+      if (!current || current.intent.format !== 1) return false;
+      await recoverRewrite(source, current, { beforeCommit, canRollback: () => canRollback?.(id) ?? true });
+      await retireRewriteJournal(current);
+      return !current.committed;
+    } finally {
+      await source.handle.close();
+    }
+  })().finally(() => recoveries.delete(key));
+  recoveries.set(key, recovery);
+  return recovery;
+}
+
+async function retryLockedRewrites(persistence, pending, options) {
+  const { retrySignal, onError } = options;
+  for (const delay of recoveryRetryDelays) {
+    if (pending.size === 0 || retrySignal.aborted) return;
+    try { await wait(delay, undefined, { signal: retrySignal, ref: false }); } catch (error) {
+      if (retrySignal.aborted) return;
+      throw error;
+    }
+    for (const id of pending) {
+      if (retrySignal.aborted) return;
+      try {
+        const snapshot = await persistence.stat(id);
+        if (snapshot) await recoverSessionRewrite(persistence, snapshot, options);
+        pending.delete(id);
+      } catch (error) {
+        if (error.name === 'SessionAlreadyOwnedError') continue;
+        pending.delete(id);
+        onError?.(id, error);
+      }
     }
   }
 }
 
+/** Recover transactions left by a previous Host before admitting new rewrites. */
+export async function recoverStoredSessions(persistence, options = {}) {
+  const { onError, retrySignal } = options;
+  const locked = new Set();
+  for (const snapshot of await persistence.list()) {
+    if (retrySignal?.aborted) break;
+    const { id } = snapshot.header;
+    try {
+      if (snapshot.location?.kind !== 'jsonl' || !isAbsolute(snapshot.location.path)
+        || !logName.test(basename(snapshot.location.path))) continue;
+      const dshPath = checkLocation(snapshot);
+      const path = await checkedRolloutPath(dshPath);
+      await cleanupRevisionCandidates(path, { retryBusy: true, onError: error => onError?.(id, error) })
+        .catch(error => onError?.(id, error));
+      await recoverSessionRewrite(persistence, snapshot, options);
+      const { preparations, retired } = await listRewriteDebris(path);
+      if (preparations.length > 0) {
+        if (isSupportedPlatform(process.platform)) {
+          try {
+            // An unpublished directory has never modified the live session. Its
+            // native writer lease protects metadata-only cleanup of any size.
+            const lease = await acquireNativeLease(path, dshPath);
+            try {
+              const current = await persistence.stat(id);
+              requireRevision(current?.header.id === id && isSamePath(checkLocation(current), dshPath), '会话状态已变更，请刷新后重试。');
+              await lease.assertHeld();
+              await cleanRewriteDebris((await listRewriteDebris(path)).preparations);
+            } finally { await lease.close(); }
+          } catch (error) { onError?.(id, error); }
+        } else {
+          const source = await openLocked(persistence, id, snapshot);
+          try {
+            await cleanRewriteDebris((await listRewriteDebris(source.path)).preparations);
+          } finally {
+            await source.handle.close();
+          }
+        }
+      }
+      await cleanRewriteDebris(retired);
+    } catch (error) {
+      if (retrySignal && error.name === 'SessionAlreadyOwnedError') locked.add(id);
+      onError?.(id, error);
+    }
+  }
+  if (locked.size > 0) {
+    void retryLockedRewrites(persistence, locked, options).catch(error => onError?.('startup', error));
+  }
+}
+
+export async function recoverPendingRewrite(persistence, snapshot, options) {
+  if (snapshot?.location?.kind !== 'jsonl') return false;
+  const path = await checkedRolloutPath(checkLocation(snapshot));
+  await retrySettledRewriteRetirement(path);
+  if (!await hasPendingRewrite(path)) return false;
+  const recovered = await recoverSessionRewrite(persistence, snapshot, options);
+  requireRevision(!await hasPendingRewrite(path), '上次编辑尚未完成恢复，请检查运行日志。');
+  return recovered;
+}
+
 export async function assertNoPendingRewrite(snapshot) {
   if (snapshot?.location?.kind === 'jsonl') {
-    requireRevision(!await hasPendingRewrite(checkLocation(snapshot)), '上次编辑尚未完成恢复，请检查运行日志。');
+    const path = await checkedRolloutPath(checkLocation(snapshot));
+    await retrySettledRewriteRetirement(path);
+    requireRevision(!await hasPendingRewrite(path), '上次编辑尚未完成恢复，请检查运行日志。');
   }
 }
 
@@ -419,8 +538,6 @@ export async function rewriteStoredSession(persistence, {
     const seen = new Set([sessionId]);
     await collectChildTree(persistence, source, retained, plan.time, retainedChildren, seen);
     await collectChildTree(persistence, source, withdrawn, undefined, withdrawnChildren, seen);
-    requireRevision(withdrawnChildren.length === 0 || process.platform !== 'win32',
-      '当前系统不支持清理关联的子智能体会话。');
     const message = rewriteMessage(plan.message, { text, textParts }, removedAttachments, addedAttachments);
     const replacement = await encodeReplacement(source, plan, message, controls, retained.filter(event => event.seq >= plan.cut));
     const removedChildren = withdrawnChildren.map(child => child.handle.header.id);
@@ -462,7 +579,7 @@ export async function rewriteStoredSession(persistence, {
         if (markerFailed) await closeFailedReload?.();
         const current = await openLocked(persistence, sessionId, await persistence.stat(sessionId));
         try {
-          requireRevision(current.path === source.path && (canRollback?.() ?? true), '无法确认候选会话已释放。');
+          requireRevision(isSamePath(current.path, source.path) && (canRollback?.() ?? true), '无法确认候选会话已释放。');
           if (markerFailed) await clearFailedCommitMarker(journal);
           await recoverRewrite(current, journal, { canRollback, beforeCommit });
         } finally {
