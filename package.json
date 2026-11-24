@@ -1,6 +1,6 @@
 {
   "name": "@kabxx/dsh-message-revision",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Edit and resend sent messages in place for DeepSeek Harness.",
   "type": "module",
   "publishConfig": {
